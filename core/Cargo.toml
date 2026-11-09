@@ -1,0 +1,125 @@
+[package]
+name = "magpie-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "magpie_core"
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled", "serde_json"] }
+fastembed = "6"
+reqwest = { version = "0.13", features = ["json", "gzip"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = "0.3"
+ignore = "0.4"
+# siglip.rs drives these directly; versions pinned to match fastembed's tree
+ort = "=2.0.0-rc.13"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+image = "0.25"
+ndarray = "0.17"
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"] }
+ureq = { version = "3.4", default-features = false, features = ["native-tls"] }
+base64 = "0.22"
+chrono = "0.4"
+getrandom = "0.3"
+pdf-inspector = "1.15.0"
+lopdf = "0.42"
+# deflate-flate2 (miniz_oxide) instead of default zlib-rs: zlib-rs 0.6 hits a
+# const-eval ICE on rustc 1.89 under the release LTO profile
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+quick-xml = "=0.41.0"
+arboard = "3.6.1"
+pinyin = "0.10"
+# macOS app bundles: Info.plist and InfoPlist.loctable (localized app names)
+plist = "1"
+# video frame decoding for shot detection; prefers a system ffmpeg, can
+# auto-download a static build on first use
+ffmpeg-sidecar = "2"
+# time zones for the calculator (tz.rs)
+chrono-tz = "0.10.4"
+# running processes for `kill <name>` (procs.rs)
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
+serde-transcode = "1.1.1"
+md-5 = "0.11.0"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
+listeners = "0.6.1"
+if-addrs = "0.15.0"
+trash = "5.2.9"
+similar = "3.2.0"
+rqrr = "0.11.0"
+dirs = "7.0.0"
+# secret shapes in clipboard text (secrets.rs); already in the tree via tokenizers
+regex = "1"
+# 农历, 节气 and festivals, computed locally (chinese_calendar.rs); MIT
+tyme4rs = "1.5"
+# where a download came from (origin.rs); already in the tree via reqwest
+url = "2.5"
+# GBK entry names in zips (files.rs); already in the tree via reqwest and lopdf
+encoding_rs = "0.8"
+
+# runs on the main thread from its own main(): AppKit requires it on macOS
+[[test]]
+name = "app_icons_main"
+harness = false
+
+[target.'cfg(unix)'.dependencies]
+# the download origin browsers leave in extended attributes (origin.rs);
+# already in the tree via tar (ffmpeg-sidecar)
+xattr = "1.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux loads Microsoft's libonnxruntime at run time instead of linking ort's
+# prebuilt, which needs glibc 2.38 (see onnx.rs). Unifies with the ort above
+# and fastembed's, so the whole tree loads dynamically on Linux only.
+ort = { version = "=2.0.0-rc.13", features = ["load-dynamic"] }
+
+[target."cfg(windows)".dependencies]
+clipboard-win = "5.4.1"
+# app icons (apps.rs): the shell's own image for a Start Menu shortcut.
+# 0.61 is the version tauri already builds, so this adds no second copy.
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_Com",
+  "Win32_UI_Shell",
+  # system commands (syscmd.rs): lock, sleep, dark mode, recycle bin
+  "Win32_System_Shutdown",
+  "Win32_System_Power",
+  "Win32_System_Registry",
+  "Win32_UI_WindowsAndMessaging",
+  # volume (volume.rs): the default output endpoint through Core Audio
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  # 节气 reminders (toast.rs): a toast whose click reaches the app
+  "UI_Notifications",
+  "Data_Xml_Dom",
+  "Foundation",
+  # rounded palette corners on Windows 11 (corners.rs)
+  "Win32_Graphics_Dwm",
+  # selection search (selection.rs): is the hotkey's modifier still held
+  "Win32_UI_Input_KeyboardAndMouse",
+  # script commands (scripts.rs): the code page console programs print in
+  "Win32_Globalization",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# the lock-screen call lives in a private framework, loaded at run time
+libloading = "0.9.0"
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+
+# WORK build only: opt in to ort's official prebuilt ONNX Runtime download at build time.
+# No dependency is downloaded by the app at search time.
+[features]
+ort-prebuilt = ["ort/download-binaries"]

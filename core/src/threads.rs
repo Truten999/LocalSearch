@@ -1,0 +1,249 @@
+//! How many CPU threads each ONNX session (text embedding, image embedding,
+//! OCR) may use. One knob in meta, applied to every session at load time;
+//! the app reloads the models when it changes.
+//!
+//! Without a cap ONNX Runtime takes every core it can see, which turns an
+//! embed pass on a 32-core desktop into a 32-thread burst that the user
+//! notices. Measured there with e5-small (chunks per second at cores used):
+//! 1 thread 4.5 at 1.0, 4 threads 14.7 at 3.8, all 32 threads 26 at 21.8.
+//! Two threads are the conservative default for a fanless laptop; more are
+//! available in settings. File and image passes also share a compute slot.
+
+use crate::db;
+use rusqlite::Connection;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub const META_KEY: &str = "index_threads";
+
+/// The CPU execution provider every ONNX session uses (text embedding, image
+/// embedding, OCR), with ONNX Runtime's memory arena switched off.
+///
+/// The arena keeps the peak of every batch a session has ever run and never
+/// hands it back, so a long-running app ends up holding the largest batch's
+/// working memory forever: that was most of the gigabytes in issue #4.
+/// Measured on e5-small after four batches of 16 passages at 512 tokens:
+/// arena on 1910 MB private, arena off 784 MB, the model's own size. Speed
+/// did not suffer: a batch took 1803 ms with the arena and 1432 ms without,
+/// a single query 10.2 ms and 3.4 ms.
+pub fn cpu_provider() -> ort::ep::ExecutionProviderDispatch {
+    ort::ep::CPU::default().with_arena_allocator(false).build()
+}
+
+/// The model an embed pass drives. Each has its own stop flag, so reloading
+/// one never interrupts a pass on the other. (OCR has none: its passes take
+/// the engine per item, so a reload swaps it in between two items anyway.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Model {
+    Text,
+    Image,
+}
+
+static STOP: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
+
+// Limit concurrent CPU-heavy embedding workloads: the text and image model
+// each own an ONNX thread pool, so independent 4-core pools can saturate a
+// fanless laptop. The guard is scoped to one batch / one image inference.
+static COMPUTE_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn compute_guard() -> std::sync::MutexGuard<'static, ()> {
+    COMPUTE_SLOT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+
+/// Ask every pass driving `model` to end at its next item. A pass holds the
+/// model for its whole run, so without this a reload would wait for the run
+/// to finish, at the old thread count, before it could swap the session in.
+/// The reload's own catch-up pass then picks up where the run stopped.
+pub fn stop(model: Model) {
+    STOP[model as usize].store(true, Ordering::SeqCst);
+}
+
+/// Let passes on `model` run again: the reload swapped its session in, or
+/// gave up. Every reload path must end here, or nothing embeds again.
+pub fn resume(model: Model) {
+    STOP[model as usize].store(false, Ordering::SeqCst);
+}
+
+/// Checked by the passes once per item (per batch where they batch): a
+/// reload wants the model, or another pass is waiting for it.
+pub fn stopping(model: Model) -> bool {
+    if STOP[model as usize].load(Ordering::SeqCst) {
+        return true;
+    }
+    if WAITING[model as usize].load(Ordering::SeqCst) > 0 {
+        YIELDED[model as usize].store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
+/// Passes blocked on a model's lock right now (see [`want`]).
+static WAITING: [std::sync::atomic::AtomicUsize; 2] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+/// Set when a long pass gave the model up for a waiter; its caller resumes.
+static YIELDED: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
+
+/// Say that this pass is about to wait for `model`. While the guard lives,
+/// the long background passes (the startup catch-up, a stars sync) end at
+/// their next batch and hand the lock over, instead of holding it for
+/// minutes: a first launch spent about three minutes embedding browser
+/// history, and a folder added meanwhile was not indexed until it finished.
+/// Drop the guard once the lock is held.
+pub fn want(model: Model) -> WantGuard {
+    WAITING[model as usize].fetch_add(1, Ordering::SeqCst);
+    WantGuard(model)
+}
+
+pub struct WantGuard(Model);
+
+impl Drop for WantGuard {
+    fn drop(&mut self) {
+        WAITING[self.0 as usize].fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Is a pass waiting for `model`?
+pub fn waited_for(model: Model) -> bool {
+    WAITING[model as usize].load(Ordering::SeqCst) > 0
+}
+
+/// Did a pass stop early for a waiter since the last call? Clears the flag.
+/// A caller that sees true runs the pass again once the waiter is served.
+pub fn take_yielded(model: Model) -> bool {
+    YIELDED[model as usize].swap(false, Ordering::SeqCst)
+}
+/// Applied when nothing is stored.
+// The MacBook Air should not become unusable during initial indexing.
+// An explicit user preference still overrides this conservative default.
+pub const DEFAULT: usize = 2;
+
+/// Logical cores on this machine (1 when the OS will not say).
+pub fn cores() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// Turn the stored setting into a thread count: `None` is the default cap,
+/// `0` means every core, `n` means `n`. Always within `1..=cores`.
+pub fn resolve(setting: Option<usize>, cores: usize) -> usize {
+    let cores = cores.max(1);
+    match setting {
+        None => DEFAULT.min(cores),
+        Some(0) => cores,
+        Some(n) => n.min(cores),
+    }
+}
+
+/// What the settings page shows: the stored choice clamped to the machine,
+/// with `0` kept as "every core" so that choice stays selectable.
+pub fn displayed(setting: Option<usize>, cores: usize) -> usize {
+    match setting {
+        Some(0) => 0,
+        other => resolve(other, cores),
+    }
+}
+
+/// The raw stored setting, if any (unparseable values count as unset).
+pub fn setting(conn: &Connection) -> Option<usize> {
+    db::meta_get(conn, META_KEY).ok().flatten().and_then(|v| v.parse().ok())
+}
+
+/// The thread count to load sessions with right now.
+pub fn from_meta(conn: &Connection) -> usize {
+    resolve(setting(conn), cores())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_caps_at_two_but_never_above_the_machine() {
+        assert_eq!(resolve(None, 32), 2);
+        assert_eq!(resolve(None, 4), 2);
+        assert_eq!(resolve(None, 2), 2);
+        assert_eq!(resolve(None, 1), 1);
+    }
+
+    #[test]
+    fn zero_means_every_core() {
+        assert_eq!(resolve(Some(0), 32), 32);
+        assert_eq!(resolve(Some(0), 1), 1);
+    }
+
+    #[test]
+    fn explicit_counts_are_clamped_to_the_machine() {
+        assert_eq!(resolve(Some(2), 32), 2);
+        assert_eq!(resolve(Some(8), 32), 8);
+        assert_eq!(resolve(Some(8), 6), 6);
+        assert_eq!(resolve(Some(1), 6), 1);
+        assert_eq!(resolve(Some(usize::MAX), 6), 6);
+    }
+
+    #[test]
+    fn a_machine_reporting_zero_cores_still_gets_one_thread() {
+        assert_eq!(resolve(None, 0), 1);
+        assert_eq!(resolve(Some(0), 0), 1);
+        assert_eq!(resolve(Some(3), 0), 1);
+    }
+
+    #[test]
+    fn the_settings_page_sees_the_clamped_choice_with_zero_kept() {
+        assert_eq!(displayed(None, 32), DEFAULT);
+        assert_eq!(displayed(None, 2), 2);
+        assert_eq!(displayed(Some(0), 32), 0, "'every core' stays selectable");
+        assert_eq!(displayed(Some(8), 32), 8);
+        assert_eq!(displayed(Some(8), 6), 6, "imported from a bigger machine");
+    }
+
+    #[test]
+    fn stop_flags_are_per_model_and_off_by_default() {
+        // one test for both flags: they are process-global
+        assert!(!stopping(Model::Text) && !stopping(Model::Image));
+        stop(Model::Text);
+        assert!(stopping(Model::Text), "text passes are told to stop");
+        assert!(!stopping(Model::Image), "image passes are not");
+        resume(Model::Text);
+        stop(Model::Image);
+        assert!(!stopping(Model::Text) && stopping(Model::Image));
+        resume(Model::Image);
+        assert!(!stopping(Model::Text) && !stopping(Model::Image));
+
+        // a waiter makes the long passes let go, and says so once
+        assert!(!take_yielded(Model::Text));
+        {
+            let _w = want(Model::Text);
+            assert!(waited_for(Model::Text) && !waited_for(Model::Image));
+            assert!(stopping(Model::Text), "the running pass ends its batch");
+            assert!(!stopping(Model::Image), "the image passes are unaffected");
+        }
+        assert!(!waited_for(Model::Text), "the guard is gone once the lock is held");
+        assert!(!stopping(Model::Text), "the waiter's own pass runs undisturbed");
+        assert!(take_yielded(Model::Text), "the background pass learns it gave way");
+        assert!(!take_yielded(Model::Text), "and only once");
+        // a reload stop is not a yield: the caller must not loop on it
+        stop(Model::Text);
+        assert!(stopping(Model::Text));
+        assert!(!take_yielded(Model::Text));
+        resume(Model::Text);
+        // two waiters: the flag holds until both have their lock
+        let a = want(Model::Image);
+        let b = want(Model::Image);
+        drop(a);
+        assert!(waited_for(Model::Image));
+        drop(b);
+        assert!(!waited_for(Model::Image));
+    }
+
+    #[test]
+    fn stored_values_round_trip_and_junk_is_unset() {
+        let conn = db::open_in_memory().unwrap();
+        assert_eq!(setting(&conn), None);
+        db::meta_set(&conn, META_KEY, "8").unwrap();
+        assert_eq!(setting(&conn), Some(8));
+        db::meta_set(&conn, META_KEY, "0").unwrap();
+        assert_eq!(setting(&conn), Some(0));
+        db::meta_set(&conn, META_KEY, "lots").unwrap();
+        assert_eq!(setting(&conn), None, "junk falls back to the default cap");
+        assert!(from_meta(&conn) >= 1);
+    }
+}

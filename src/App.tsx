@@ -1,0 +1,7734 @@
+import ModelLibraryPanel from "./ModelLibraryPanel";
+import TestModuleDiagnostics from "./TestModuleDiagnostics";
+import TestStatusBar from "./TestStatusBar";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { check as checkUpdate, type Update } from "@tauri-apps/plugin-updater";
+import {
+  BANGS_KEY,
+  DEFAULT_BANGS,
+  TIPS_KEY,
+  loadBangs,
+  matchBang,
+  nextTip,
+  randomTip,
+  searchEmoji,
+  tipsEnabled,
+  type BangMatch,
+  type EmojiHit,
+  matchNote,
+  type NoteMatch,
+  recentsEnabled,
+  setRecentsEnabled,
+  recallEnabled,
+  setRecallEnabled,
+  todayLineEnabled,
+  setTodayLineEnabled,
+  todayText,
+  type TodayLine,
+} from "./extras";
+import { currentLang, modelStatusRu, loadLangPref, resolveLang, setLang, t, tf, type LangPref } from "./i18n";
+import "./App.css";
+import "./TestResponsiveUI.css";
+import IndexSourcesPanel from "./IndexSourcesPanel";
+import SearchHistoryPanel, { rememberSearch, explainErrorRu } from "./LocalSearchUX";
+
+/// Why the daily recall card (recall.rs) shows this row: kept on this date
+/// years ago, or kept long ago. Nothing else is claimed.
+type Recall = { why: "anniversary"; years: number } | { why: "long_ago"; months: number };
+
+interface RepoHit {
+  kind: "repo";
+  id: number;
+  full_name: string;
+  description: string | null;
+  language: string | null;
+  stars: number;
+  html_url: string;
+  archived: boolean;
+  pushed_at: string | null;
+  score: number;
+  recall?: Recall;
+}
+
+interface FileHit {
+  kind: "file";
+  id: number;
+  path: string;
+  name: string;
+  ext: string | null;
+  size: number;
+  mtime: number;
+  score: number;
+  thumb: string | null;
+  snippet: string | null;
+  match_kind?: string | null;
+}
+
+interface BookmarkHit {
+  kind: "bookmark";
+  id: number;
+  url: string;
+  title: string;
+  folder: string;
+  browser: string;
+  /** every browser holding this URL (search results) */
+  browsers?: string[];
+  added_at: number | null;
+  score: number;
+  /** found by meaning alone, no word in common with the query */
+  fuzzy?: boolean;
+  recall?: Recall;
+}
+
+interface HistoryHit {
+  kind: "history";
+  id: number;
+  url: string;
+  title: string;
+  browser: string;
+  browsers?: string[];
+  visit_count: number;
+  last_visit: number | null;
+  score: number;
+  fuzzy?: boolean;
+}
+
+interface AppHit {
+  kind: "app";
+  name: string;
+  target: string;
+  score: number;
+}
+
+interface ClipHit {
+  kind: "clip";
+  id: number;
+  content: string;
+  first_copied: number;
+  last_copied: number;
+  copy_count: number;
+  clip_kind: "text" | "image";
+  thumb: string | null;
+  width: number | null;
+  height: number | null;
+  pinned: boolean;
+  score: number;
+  /// the text with passwords and keys starred; shown until the user asks
+  masked: string | null;
+}
+
+interface VideoHit {
+  kind: "video";
+  id: number;
+  shot_id: number;
+  path: string;
+  name: string;
+  start_ms: number;
+  end_ms: number;
+  ts_ms: number;
+  thumb: string | null;
+  duration_ms: number;
+  score: number;
+}
+
+/// The calculator / transform row above the results.
+interface CalcHit {
+  value: string;
+  alt: string | null;
+  swatch?: string | null;
+  /// the value explains why the input did not work; Enter copies nothing
+  error?: boolean;
+  /// a PNG (base64) to show and copy instead of text, e.g. a QR code
+  image?: string | null;
+  /// `timer 25m …`: seconds; Enter starts the countdown, `value` is the reminder
+  timer?: number | null;
+  /// `timer` alone: the running countdowns; Enter stops them all
+  timerIds?: number[];
+  /// `diff`: the last two copies, line by line ("+", "-" or " ", text)
+  diff?: [string, string][];
+  /// what Enter does instead of copying: `open:<path>`, `volume:<n>`, `mute:<bool>`
+  action?: string | null;
+  /// the query this answers; an action is only taken while it is still typed
+  forQuery?: string;
+  /// not a calculation: `calendar` (农历) shows without "=" under its own badge
+  badge?: string | null;
+}
+
+/// Labels the backend gives calculator / transform rows, translated when
+/// shown; any other label (numbers in it, a unit) shows as it comes.
+const CALC_LABELS = [
+  "Chinese capitals",
+  "pinyin",
+  "half-width",
+  "full-width",
+  "unicode decoded",
+  "unicode escaped",
+  "html decoded",
+  "html escaped",
+  "coin",
+  "dice",
+  "system",
+  "QR code in the copied image",
+  "open folder",
+  "show file in folder",
+  "volume",
+  "set volume",
+  "mute",
+  "unmute",
+  "already muted",
+  "not muted",
+];
+
+/// Rows that only show something (the volume now, "already muted"): Enter
+/// does nothing there, rather than copy "🔊 38%".
+const INFO_LABELS = ["volume", "already muted", "not muted"];
+
+/// The tip slot taken by the day's solar term couplet (never a real tip text)
+function isInfoRow(c: CalcHit): boolean {
+  return !c.action && !c.error && INFO_LABELS.includes(c.alt ?? "");
+}
+
+/// What Enter does on a row with an action, for its sub line.
+const ACTION_HINTS: Record<string, string> = {
+  open: "Enter opens it",
+  volume: "Enter sets it",
+  mute: "Enter does it",
+};
+/// Messages rows answer with when they cannot do their job; translated too.
+const CALC_MESSAGES = [
+  "Turn on clipboard history to compare the last two things you copied",
+  "Copy two pieces of text first; diff compares the last two",
+  "The last two copies are the same",
+  "No QR code found in the copied image",
+  "No audio output device found",
+];
+
+function calcLabel(alt: string | null | undefined): string {
+  if (!alt) return "";
+  const m = /^clipboard → (.+)$/.exec(alt);
+  if (m) return `${t("clipboard")} → ${CALC_LABELS.includes(m[1]) ? t(m[1]) : m[1]}`;
+  return CALC_LABELS.includes(alt) ? t(alt) : alt;
+}
+
+/// 1500 → "25:00", 5400 → "1:30:00"
+function clock(secs: number): string {
+  const s = Math.max(0, Math.round(secs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
+}
+
+/// A system command (lock, sleep, restart, …) offered next to apps.
+interface CommandHit {
+  kind: "command";
+  id: string;
+  destructive: boolean;
+  score: number;
+}
+
+/// A running process, listed by `kill <name>`.
+interface ProcessHit {
+  kind: "process";
+  pid: number;
+  name: string;
+  memory: number;
+  exe: string | null;
+  /** port search: the sockets it listens on ("TCP 0.0.0.0:3000") */
+  listen?: string;
+  /** `cpu`: share of the whole machine, 0–100 */
+  cpu?: number;
+  /** `top` / `cpu`: every process of this name together */
+  group?: { count: number; memory: number };
+}
+
+/// One thing in a workspace (workspace.rs): a file opens in its default
+/// app, an app launches, a url opens in the browser.
+interface WsItem {
+  kind: "file" | "app" | "url";
+  target: string;
+  title: string;
+}
+
+interface Workspace {
+  name: string;
+  items: WsItem[];
+  updated: number;
+}
+
+/// A workspace matching the query: Enter opens everything in it.
+interface WorkspaceHit extends Workspace {
+  kind: "workspace";
+  score: number;
+}
+
+/// A script command from the scripts folder (scripts.rs), with the
+/// arguments typed after its keyword.
+interface ScriptHit {
+  kind: "script";
+  path: string;
+  title: string;
+  mode: "fullOutput" | "compact" | "silent";
+  package: string | null;
+  description: string | null;
+  icon: string | null;
+  keyword: string | null;
+  args: { placeholder: string; optional: boolean }[];
+  confirm: boolean;
+  runner: string | null;
+  score: number;
+  given: string[];
+}
+
+interface ScriptOutput {
+  ok: boolean;
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timed_out: boolean;
+}
+
+type Hit =
+  | RepoHit
+  | FileHit
+  | BookmarkHit
+  | HistoryHit
+  | ClipHit
+  | AppHit
+  | VideoHit
+  | CommandHit
+  | ProcessHit
+  | WorkspaceHit
+  | ScriptHit
+  | FolderHit;
+
+/// A pinned folder (pins.rs) at the top of the local tab's empty box.
+interface FolderHit {
+  kind: "folder";
+  path: string;
+  name: string;
+  score: number;
+}
+
+/// A Windows Store (packaged) app: its target is the shell's name for it,
+/// not a file (apps.rs `STORE_APP_PREFIX`).
+function isStoreApp(target: string): boolean {
+  return target.startsWith("shell:AppsFolder\\");
+}
+
+/// What a row adds to a workspace, if it can be in one.
+function wsItemOf(h: Hit): WsItem | null {
+  switch (h.kind) {
+    case "file":
+    case "video":
+      return { kind: "file", target: h.path, title: h.name };
+    case "app":
+      return { kind: "app", target: h.target, title: h.name };
+    case "bookmark":
+    case "history":
+      return { kind: "url", target: h.url, title: h.title || h.url };
+    case "repo":
+      return { kind: "url", target: h.html_url, title: h.full_name };
+    default:
+      return null;
+  }
+}
+
+/// The recall card's line: when it was kept, in the words of its kind.
+function recallText(r: Recall, kind: "bookmark" | "repo"): string {
+  const star = kind === "repo";
+  if (r.why === "anniversary") {
+    if (r.years === 1) return t(star ? "A year ago today you starred this" : "A year ago today you bookmarked this");
+    return tf(star ? "{n} years ago today you starred this" : "{n} years ago today you bookmarked this", { n: r.years });
+  }
+  if (r.months >= 24) {
+    return tf(star ? "Starred {n} years ago" : "Bookmarked {n} years ago", { n: Math.floor(r.months / 12) });
+  }
+  return tf(star ? "Starred {n} months ago" : "Bookmarked {n} months ago", { n: r.months });
+}
+
+/// A stable identity per row, for React keys and for the "press Enter
+/// again" confirmation.
+function hitKey(r: Hit): string {
+  switch (r.kind) {
+    case "app":
+      return `app-${r.target}`;
+    case "command":
+      return `command-${r.id}`;
+    case "process":
+      return `process-${r.pid}`;
+    case "workspace":
+      return `workspace-${r.name.toLowerCase()}`;
+    case "script":
+      return `script-${r.path}`;
+    case "folder":
+      return `folder-${r.path}`;
+    default:
+      return `${r.kind}-${r.id}`;
+  }
+}
+
+/// What `ocr_clipboard` answers when it cannot read text; the backend speaks
+/// English and these are translated when shown (keep in step with lib.rs).
+const OCR_MESSAGES = [
+  "Turn on Image text (OCR) in settings to read text from images",
+  "The OCR model is still getting ready",
+  "No text found in the copied image",
+  "No image on the clipboard",
+  "The clipboard holds something marked confidential",
+];
+
+/// `port 3000` / `端口 3000` / `kill :3000` → 3000; anything else → null.
+function matchPort(q: string): number | null {
+  const m = /^(?:(?:port|端口)\s+:?|(?:kill|结束)\s+:)(\d{1,5})$/i.exec(q.trim());
+  const n = m ? Number(m[1]) : NaN;
+  return n >= 1 && n <= 65535 ? n : null;
+}
+
+/// `kill chrome` / `结束 chrome` → "chrome"; anything else → null.
+function matchKill(q: string): string | null {
+  const m = /^(?:kill|结束)\s+(.+)$/i.exec(q.trim());
+  return m ? m[1].trim() : null;
+}
+
+interface FolderInfo {
+  id: number;
+  path: string;
+  file_count: number;
+}
+
+/// What a launch asked for on the command line (src-tauri/src/cli.rs).
+interface LaunchRequest {
+  toggle: boolean;
+  source: string | null;
+  query: string | null;
+}
+
+/// The summon key on a Wayland desktop (src-tauri/src/wayland_hotkey.rs).
+interface WaylandHotkeyInfo {
+  desktop: "sway" | "hyprland" | "niri" | "gnome" | "kde" | "other";
+  hotkey: string;
+  registered: boolean;
+  command: string;
+  snippet: string | null;
+  error: string | null;
+}
+
+interface Status {
+  repo_count: number;
+  file_count: number;
+  folder_count: number;
+  bookmark_count: number;
+  history_count: number;
+  clip_count: number;
+  clipboard_enabled: boolean;
+  clip_retention_days: number;
+  clip_max_entries: number;
+  app_aliases: string;
+  app_folders: string[];
+  video_count: number;
+  video_shot_count: number;
+  video_indexing_enabled: boolean;
+  /// prune linked git worktrees whose main checkout is indexed (default on)
+  skip_worktrees: boolean;
+  video_indexing: boolean;
+  video_note: string;
+  ffmpeg_status: string;
+  video_decode_threads: number;
+  video_hwaccel: boolean;
+  index_threads: number;
+  sleep_index_enabled: boolean;
+  sleep_index_active: boolean;
+  cpu_cores: number;
+  mcp_enabled: boolean;
+  mcp_status: string;
+  mcp_url: string;
+  mcp_command: string;
+  watch_enabled: boolean;
+  watch_status: string;
+  watched_folders: number;
+  rescan_minutes: number;
+  embedded_count: number;
+  last_sync: string | null;
+  username: string | null;
+  has_token: boolean;
+  model: string;
+  image_model: string;
+  ocr_enabled: boolean;
+  ocr_model: string;
+  ocr_status: string;
+  ocr_pdf: boolean;
+  /// 节气 reminders (unset: on in Chinese, off in English)
+  term_notify?: boolean;
+  /// the first day of a solar term (reminders on): its couplet joins the tips
+  term_today?: { term: string; line: string; source: string } | null;
+  /// Windows: "round" when the system rounds the window (11), "square" when
+  /// it cannot (10); absent elsewhere, where the CSS radius stands
+  window_corners?: "round" | "square" | null;
+  /// Linux on Wayland: how the summon key is bound there (#15); absent
+  /// elsewhere, where the ordinary key grab works
+  wayland_hotkey?: WaylandHotkeyInfo | null;
+  syncing: boolean;
+  local_indexing: boolean;
+  max_file_mb: number;
+  hotkey: string;
+  /// semantic search (#8): "undecided" = a fresh install before the welcome screen
+  semantic: "on" | "off" | "undecided";
+  semantic_paused: boolean;
+  /// the effective selection-search chord; empty when the user removed it
+  hotkey_selection: string;
+  hotkey_selection_default: string;
+  note_path: string;
+  hf_endpoint: string;
+  version: string;
+  parallel_test: boolean;
+}
+
+interface StarsProgress {
+  stage: "listing" | "readmes" | "embedding";
+  page?: number;
+  total: number;
+  done?: number;
+}
+
+interface LocalProgress {
+  stage: "scan" | "embed" | "embed-images" | "videos";
+  done: number;
+  total?: number;
+}
+
+const PAGE = 8;
+const WINDOW_WIDTH = 720;
+// the palette keeps its own width and the preview pane is added beside it, so
+// the tab strip and the query row never reflow when the pane opens
+const PREVIEW_PANE_WIDTH = 372;
+const WINDOW_WIDTH_PREVIEW = WINDOW_WIDTH + PREVIEW_PANE_WIDTH;
+// the list area is at least this tall while the pane is open, so a single
+// result still gets a preview worth reading (about 12 lines of text)
+const PREVIEW_MIN_HEIGHT = 260;
+
+/// What the index knows about a web address (webinfo.rs).
+interface WebInfo {
+  host: string;
+  bookmarks: { browser: string; folder: string; added_at: number | null }[];
+  visits: number;
+  first_visit: number | null;
+  last_visit: number | null;
+  description: string | null;
+}
+
+/// Where a file was downloaded from (origin.rs): the host to show, and the
+/// page to open when one was recorded.
+interface FileOrigin {
+  host: string;
+  page: string | null;
+}
+
+/// One row of "Add common places" (common_places in lib.rs).
+interface CommonPlace {
+  kind: string;
+  path: string;
+  state: "new" | "added" | "covered" | "contains";
+  files: number;
+  more: boolean;
+}
+const PLACE_LABELS: Record<string, string> = {
+  downloads: "Downloads",
+  desktop: "Desktop",
+  screenshots: "Screenshots",
+  wechat: "Files received in WeChat",
+  qq: "Files received in QQ",
+};
+// how long the selection must rest on a local file before its preview loads:
+// key repeat is 30–50 ms a step, so this tells passing over a row from
+// stopping on it (800 ms felt slow on a Mac, #13)
+const LOCAL_PREVIEW_DELAY_MS = 350;
+
+/// State fetched for one thing (a selected row, a path, an address), stored
+/// with that thing's key and read back only under it. Clearing it in the
+/// effect that refetches came one frame late: the new row rendered once with
+/// the previous row's preview, download source or bookmarks.
+function useKeyedState<T>(key: string | null): [T | null, (key: string, value: T) => void] {
+  const [state, setState] = useState<{ key: string; value: T } | null>(null);
+  const set = useCallback((k: string, value: T) => setState({ key: k, value }), []);
+  return [state !== null && key !== null && state.key === key ? state.value : null, set];
+}
+
+/// localStorage keys included in a settings export/import.
+const LOCAL_KEYS = [
+  "magpie.bangs",
+  "magpie.tips",
+  "magpie.recents",
+  "magpie.recall",
+  "magpie.todayline",
+  "magpie.taborder",
+  "magpie.tabhidden",
+  "magpie.defaulttab",
+  "magpie.theme",
+  "magpie.lang",
+  "magpie.scope",
+  "magpie.webscope",
+  "magpie.sort",
+  "magpie.hideonblur",
+  "magpie.tabkeys",
+] as const;
+
+/// macOS gets ⌘ in the key hints. The handlers themselves accept Ctrl or Cmd
+/// on every platform, so this only changes what the footer says.
+const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.userAgent);
+const IS_WIN = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+const MOD = IS_MAC ? "⌘" : "Ctrl";
+
+/// Settings pages, one per part of the app (#6).
+type SettingsSection = "general" | "local" | "sources" | "web" | "stars" | "clips" | "about";
+const SETTINGS_SECTIONS: { id: SettingsSection; label: string }[] = [
+  { id: "general", label: "General" },
+  { id: "local", label: "Local Files" },
+  { id: "sources", label: "Источники индекса" },
+  { id: "web", label: "Web" },
+  { id: "stars", label: "GitHub Stars" },
+  { id: "clips", label: "Clipboard" },
+  { id: "about", label: "About" },
+];
+/// Settings open on the page of the tab you were on.
+const SECTION_FOR_SOURCE: Record<string, SettingsSection> = {
+  local: "local",
+  web: "web",
+  "github-stars": "stars",
+  clips: "clips",
+};
+
+interface WebSource {
+  browser: string;
+  bookmarks: number;
+  history: number;
+}
+
+/// Display names of the system commands, by the backend's ids.
+const COMMAND_LABELS: Record<string, string> = {
+  lock: "Lock Screen",
+  sleep: "Sleep",
+  restart: "Restart",
+  shutdown: "Shut Down",
+  empty_trash: IS_WIN ? "Empty Recycle Bin" : "Empty Trash",
+  dark_mode: "Toggle Dark Mode",
+  // system settings pages (syscmd.rs PANES)
+  settings_wifi: "Wi-Fi Settings",
+  settings_bluetooth: "Bluetooth Settings",
+  settings_network: "Network Settings",
+  settings_display: "Display Settings",
+  settings_sound: "Sound Settings",
+  settings_power: IS_WIN ? "Power & Battery" : "Battery",
+  settings_default_apps: "Default Apps",
+  settings_apps: "Installed Apps",
+  settings_keyboard: "Keyboard Settings",
+  settings_mouse: IS_MAC ? "Trackpad Settings" : "Mouse & Touchpad",
+  settings_notifications: "Notification Settings",
+  settings_datetime: "Date & Time Settings",
+  settings_language: "Language & Region",
+  settings_update: IS_WIN ? "Windows Update" : "Software Update",
+  settings_privacy: "Privacy & Security",
+  settings_printers: "Printers",
+  settings_wallpaper: "Wallpaper",
+  settings_storage: "Storage",
+};
+const COMMAND_GLYPHS: Record<string, string> = {
+  lock: "🔒",
+  sleep: "🌙",
+  restart: "🔄",
+  shutdown: "⏻",
+  empty_trash: "🗑️",
+  dark_mode: "🌓",
+  settings_wifi: "📶",
+  settings_bluetooth: "🔵",
+  settings_network: "🌐",
+  settings_display: "🖥️",
+  settings_sound: "🔊",
+  settings_power: "🔋",
+  settings_default_apps: "⭐",
+  settings_apps: "📦",
+  settings_keyboard: "⌨️",
+  settings_mouse: "🖱️",
+  settings_notifications: "🔔",
+  settings_datetime: "🕒",
+  settings_language: "🌏",
+  settings_update: "⬆️",
+  settings_privacy: "🛡️",
+  settings_printers: "🖨️",
+  settings_wallpaper: "🖼️",
+  settings_storage: "💾",
+};
+
+/// One entry of a row's action menu (Ctrl/Cmd+K). `risky` actions go
+/// through the same "press Enter again" confirmation as their rows.
+interface RowAction {
+  key: string;
+  label: string;
+  risky?: boolean;
+  /// the key that does this without the menu, shown beside it
+  shortcut?: string;
+  run: () => Promise<unknown> | void;
+}
+
+/// "Edit with" (#14, edit.rs): these extensions open in this app target on
+/// Ctrl+E / ⌘E; an empty app means the system's own edit action.
+interface EditRule {
+  exts: string[];
+  app: string;
+  /** from the backend: extensions this row lists but another row opens (#18) */
+  shadowed?: { ext: string; by: number }[];
+}
+const EDIT_SHORTCUT = IS_MAC ? "⌘E" : "Ctrl+E";
+
+/// Hide the palette when it loses focus. Stored "1"/"0"; nothing stored
+/// means the platform default: on for macOS, where a Spotlight-style panel
+/// is expected to go away on click-out, off elsewhere, where dragging files
+/// in from Explorer needs the window to survive losing focus.
+function loadHideOnBlur(): boolean {
+  try {
+    // One-time migration for the user's switch from an auto-hiding launcher
+    // to a regular, persistent desktop window. Manual changes still persist.
+    if (localStorage.getItem("localsearch.window.mode.v1") !== "regular") {
+      localStorage.setItem("localsearch.window.mode.v1", "regular");
+      localStorage.setItem("magpie.hideonblur", "0");
+      return false;
+    }
+    return localStorage.getItem("magpie.hideonblur") === "1";
+  } catch {
+    return false;
+  }
+}
+
+/// Which modifier plus 1–9 jumps straight to a tab.
+type TabKeys = "mod" | "alt" | "off";
+const TAB_KEYS: { id: TabKeys; label: string }[] = [
+  { id: "mod", label: IS_MAC ? "⌘ 1–9" : "Ctrl 1–9" },
+  { id: "alt", label: IS_MAC ? "⌥ 1–9" : "Alt 1–9" },
+  { id: "off", label: "off" },
+];
+
+function loadTabKeys(): TabKeys {
+  try {
+    const v = localStorage.getItem("magpie.tabkeys");
+    if (v === "mod" || v === "alt" || v === "off") return v;
+  } catch {
+    /* fall through to the default */
+  }
+  return "mod";
+}
+
+/// The 0-based tab a keydown asks for, or null. Reads the physical key
+/// (`code`), not the character: Option+1 types "¡" on macOS.
+function tabFromKey(
+  e: Pick<KeyboardEvent, "code" | "ctrlKey" | "metaKey" | "altKey" | "shiftKey">,
+  keys: TabKeys,
+): number | null {
+  const m = /^Digit([1-9])$/.exec(e.code);
+  if (!m || e.shiftKey || keys === "off") return null;
+  const mod = e.ctrlKey || e.metaKey;
+  const ok = keys === "mod" ? mod && !e.altKey : e.altKey && !mod;
+  return ok ? Number(m[1]) - 1 : null;
+}
+
+/// Native dialogs take focus from the palette. While one is up, a
+/// hide-on-blur must not fire, or the palette vanishes under its own dialog.
+let holdOpenCount = 0;
+async function holdOpen<T>(f: () => Promise<T>): Promise<T> {
+  holdOpenCount++;
+  try {
+    return await f();
+  } finally {
+    // focus comes back a moment after the dialog closes
+    setTimeout(() => {
+      holdOpenCount--;
+    }, 300);
+  }
+}
+
+const ALL_SOURCES = [
+  { id: "local", label: "Local Files" },
+  { id: "sources", label: "Источники индекса" },
+  { id: "github-stars", label: "GitHub Stars" },
+  { id: "web", label: "Web" },
+  { id: "clips", label: "Clipboard" },
+] as const;
+type SourceDef = (typeof ALL_SOURCES)[number];
+const DEFAULT_ORDER = ALL_SOURCES.map((s) => s.id);
+
+// Order the tabs by a saved id list, dropping unknowns and appending any
+// canonical source the saved list is missing (e.g. after an app update adds one).
+function orderedSources(saved: string[]): SourceDef[] {
+  const byId = new Map<string, SourceDef>(ALL_SOURCES.map((s) => [s.id, s]));
+  const seen = new Set<string>();
+  const out: SourceDef[] = [];
+  for (const id of saved) {
+    const s = byId.get(id);
+    if (s && !seen.has(id)) {
+      out.push(s);
+      seen.add(id);
+    }
+  }
+  for (const s of ALL_SOURCES) if (!seen.has(s.id)) out.push(s);
+  return out;
+}
+
+function loadTabOrder(): string[] {
+  try {
+    const raw = localStorage.getItem("magpie.taborder");
+    if (raw) return orderedSources(JSON.parse(raw)).map((s) => s.id);
+  } catch {
+    /* fall through to default */
+  }
+  return DEFAULT_ORDER;
+}
+
+const IMAGE_EXT_RE = /\.(jpe?g|png|webp|bmp|gif)$/i;
+
+interface ImageQuery {
+  label: string;
+  path?: string;
+  bytesB64?: string;
+  /// preview for the input-row chip (blob: URL or data: URL)
+  thumbSrc?: string;
+}
+
+type RepoSort = "relevance" | "starred" | "stars";
+const SORTS: { id: RepoSort; label: string }[] = [
+  { id: "relevance", label: "match" },
+  { id: "starred", label: "recent" },
+  { id: "stars", label: "stars" },
+];
+
+type LocalScope = "all" | "text" | "images" | "videos";
+const SCOPES: { id: LocalScope; label: string }[] = [
+  { id: "all", label: "all" },
+  { id: "text", label: "text" },
+  { id: "images", label: "images" },
+  { id: "videos", label: "videos" },
+];
+
+type WebScope = "all" | "bookmarks" | "history";
+const WEB_SCOPES: { id: WebScope; label: string }[] = [
+  { id: "all", label: "all" },
+  { id: "bookmarks", label: "bookmarks" },
+  { id: "history", label: "history" },
+];
+
+type Theme = "auto" | "light" | "dark";
+const THEMES: Theme[] = ["auto", "light", "dark"];
+
+const HF_ENDPOINTS: { url: string; label: string }[] = [
+  { url: "https://huggingface.co", label: "huggingface.co" },
+  { url: "https://hf-mirror.com", label: "hf-mirror.com (China)" },
+];
+
+const FILE_CAPS: { mb: number; label: string }[] = [
+  { mb: 4, label: "4 MB" },
+  { mb: 16, label: "16 MB" },
+  { mb: 64, label: "64 MB" },
+  { mb: 0, label: "Unlimited" },
+];
+
+function formatStars(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
+  return String(n);
+}
+
+function formatSize(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)}KB`;
+  return `${n}B`;
+}
+
+function relTime(iso: string | null): string | null {
+  if (!iso) return null;
+  return relTimeFromMs(Date.now() - Date.parse(iso));
+}
+
+function relTimeUnix(secs: number): string | null {
+  if (!secs) return null;
+  return relTimeFromMs(Date.now() - secs * 1000);
+}
+
+function relTimeFromMs(ms: number): string | null {
+  if (Number.isNaN(ms) || ms < 0) return null;
+  const days = ms / 86_400_000;
+  if (days < 1) return t("today");
+  if (days < 30) return tf("{n}d", { n: Math.floor(days) });
+  if (days < 365) return tf("{n}mo", { n: Math.floor(days / 30) });
+  return tf("{n}y", { n: Math.floor(days / 365) });
+}
+
+function parentDir(path: string): string {
+  const cut = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  return cut > 0 ? path.slice(0, cut) : path;
+}
+
+/// mm:ss (or h:mm:ss) for video shot ranges
+function fmtTime(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = (s % 60).toString().padStart(2, "0");
+  return h > 0 ? `${h}:${m.toString().padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+
+/// FTS snippet with \u0001..\u0002 sentinels around matches → <mark> nodes
+function renderSnippet(s: string): React.ReactNode[] {
+  const nodes: React.ReactNode[] = [];
+  s.split("\u0001").forEach((seg, i) => {
+    if (i === 0) {
+      nodes.push(seg);
+      return;
+    }
+    const [hit, ...rest] = seg.split("\u0002");
+    nodes.push(<mark key={i}>{hit}</mark>);
+    nodes.push(rest.join("\u0002"));
+  });
+  return nodes;
+}
+
+// null = nothing worth showing (an idle pipeline must not render a hint)
+function starsProgressLabel(p: StarsProgress): string | null {
+  switch (p.stage) {
+    case "listing":
+      return tf("listing stars… {n}", { n: p.total });
+    case "readmes":
+      return p.total === 0 ? null : tf("readmes {a}/{b}", { a: p.done ?? 0, b: p.total });
+    case "embedding":
+      return p.total === 0 ? null : tf("indexing stars {a}/{b}", { a: p.done ?? 0, b: p.total });
+  }
+}
+
+function localProgressLabel(p: LocalProgress): string | null {
+  if (p.stage === "scan") return tf("scanning files… {n}", { n: p.done });
+  if ((p.total ?? 0) === 0) return null;
+  if (p.stage === "videos") return tf("indexing videos {a}/{b}", { a: p.done, b: p.total ?? 0 });
+  return p.stage === "embed-images"
+    ? tf("indexing images {a}/{b}", { a: p.done, b: p.total ?? 0 })
+    : tf("indexing files {a}/{b}", { a: p.done, b: p.total ?? 0 });
+}
+
+// Step 24: short-lived microphone recording for FluidVoice on loopback.
+// Capture mono PCM; use WAV because FluidVoice's AVAudioFile accepts it.
+type VoiceCapture = {
+  stream: MediaStream;
+  context: AudioContext;
+  source: MediaStreamAudioSourceNode;
+  processor: ScriptProcessorNode;
+  silent: GainNode;
+  frames: Float32Array[];
+  sampleCount: number;
+  sampleRate: number;
+  timeout: number;
+  previewTimer: number;
+  previewBusy: boolean;
+  previewSampleCount: number;
+  previewRequests: number;
+  previewTask: Promise<void> | null;
+};
+
+function voiceWavBase64(frames: Float32Array[], sampleCount: number, sampleRate: number): string {
+  const length = 44 + sampleCount * 2;
+  if (sampleCount <= 0 || length > 8_000_000) throw new Error("Слишком длинная голосовая запись");
+  const raw = new Uint8Array(length);
+  const view = new DataView(raw.buffer);
+  const chunk = (offset: number, label: string) => {
+    for (let i = 0; i < 4; i++) raw[offset + i] = label.charCodeAt(i);
+  };
+  chunk(0, "RIFF"); view.setUint32(4, length - 8, true);
+  chunk(8, "WAVE"); chunk(12, "fmt "); view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  chunk(36, "data"); view.setUint32(40, sampleCount * 2, true);
+  let offset = 44;
+  for (const frame of frames) {
+    for (const value of frame) {
+      const s = Math.max(-1, Math.min(1, value));
+      view.setInt16(offset, s < 0 ? Math.round(s * 32768) : Math.round(s * 32767), true);
+      offset += 2;
+    }
+  }
+  let binary = "";
+  for (let i = 0; i < raw.length; i += 8192) {
+    binary += String.fromCharCode(...raw.subarray(i, i + 8192));
+  }
+  return btoa(binary);
+}
+
+function releaseVoiceCapture(capture: VoiceCapture) {
+  window.clearTimeout(capture.timeout);
+  window.clearInterval(capture.previewTimer);
+  capture.processor.onaudioprocess = null;
+  capture.processor.disconnect();
+  capture.source.disconnect();
+  capture.silent.disconnect();
+  capture.stream.getTracks().forEach((track) => track.stop());
+  void capture.context.close().catch(() => {});
+}
+
+export default function App() {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<Hit[]>([]);
+  const [selected, setSelected] = useState(0);
+  // read by the search while its parts arrive (see runSearch): which row is
+  // selected, and whether it is still the first one
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const resultsRef = useRef<Hit[]>([]);
+  resultsRef.current = results;
+  // whether the latest mousemove really moved the pointer (see the row's
+  // onMouseMove): the last screen position, and the verdict for the event
+  // being dispatched now
+  const pointerAtRef = useRef<{ x: number; y: number } | null>(null);
+  const pointerMovedRef = useRef(false);
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const p = pointerAtRef.current;
+      pointerMovedRef.current = p !== null && (p.x !== e.screenX || p.y !== e.screenY);
+      pointerAtRef.current = { x: e.screenX, y: e.screenY };
+    };
+    // summoned under a resting pointer: its first event is not a move
+    const onFocus = () => {
+      pointerAtRef.current = null;
+    };
+    window.addEventListener("mousemove", onMove, true);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.removeEventListener("mousemove", onMove, true);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
+  // shift+arrows extend a range from this anchor (clips only); null = single
+  const [selAnchor, setSelAnchor] = useState<number | null>(null);
+  // user-customizable tab order, visibility, and which tab opens on launch.
+  // Hidden ids are stored (not visible ones) so future sources default to shown.
+  const [sourceOrder, setSourceOrder] = useState<string[]>(loadTabOrder);
+  const [hiddenTabs, setHiddenTabs] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem("magpie.tabhidden");
+      if (raw) return JSON.parse(raw) as string[];
+    } catch {
+      /* default: nothing hidden */
+    }
+    return [];
+  });
+  const sources = useMemo(() => {
+    const visible = orderedSources(sourceOrder).filter((s) => !hiddenTabs.includes(s.id));
+    // never let the tab strip go empty, whatever storage says
+    return visible.length > 0 ? visible : orderedSources(sourceOrder);
+  }, [sourceOrder, hiddenTabs]);
+  const sourcesRef = useRef(sources);
+  sourcesRef.current = sources;
+  const [defaultTab, setDefaultTab] = useState<string>(
+    () => localStorage.getItem("magpie.defaulttab") || "local",
+  );
+  const [sourceIdx, setSourceIdx] = useState(() => {
+    let hidden: string[] = [];
+    try {
+      hidden = JSON.parse(localStorage.getItem("magpie.tabhidden") ?? "[]") as string[];
+    } catch {
+      /* nothing hidden */
+    }
+    let visible = loadTabOrder().filter((id) => !hidden.includes(id));
+    if (visible.length === 0) visible = loadTabOrder();
+    const want = localStorage.getItem("magpie.defaulttab") || "local";
+    const idx = visible.indexOf(want);
+    return idx >= 0 ? idx : 0;
+  });
+  const [status, setStatus] = useState<Status | null>(null);
+  const [starsProgress, setStarsProgress] = useState<StarsProgress | null>(null);
+  const [localProgress, setLocalProgress] = useState<LocalProgress | null>(null);
+  const [lastError, setLastError] = useState<string | null>(null);
+  // the error a star sync put on screen, which its next progress may clear
+  const syncErrorRef = useRef<string | null>(null);
+  // auto-update: idle -> checking -> available -> downloading -> done|error
+  const [updPhase, setUpdPhase] = useState<
+    "idle" | "checking" | "none" | "available" | "downloading" | "error"
+  >("idle");
+  const [updVersion, setUpdVersion] = useState<string | null>(null);
+  const [updPct, setUpdPct] = useState(0);
+  const [updError, setUpdError] = useState<string | null>(null);
+  const updRef = useRef<Update | null>(null);
+  const updPhaseRef = useRef(updPhase);
+  updPhaseRef.current = updPhase;
+  const [folders, setFolders] = useState<FolderInfo[]>([]);
+  // set only when list_folders itself fails; an empty list is not a failure
+  const [foldersFailed, setFoldersFailed] = useState(false);
+  const [showSettings, setShowSettings] = useState(!!import.meta.env.VITE_DEMO);
+  const [indexExplorerOpen, setIndexExplorerOpen] = useState(false);
+  const [searchHistoryOpen, setSearchHistoryOpen] = useState(false);
+  const [searchHistoryRevision, setSearchHistoryRevision] = useState(0);
+
+  const [tokenInput, setTokenInput] = useState("");
+  const [tokenBusy, setTokenBusy] = useState(false);
+  const [tokenError, setTokenError] = useState<string | null>(null);
+  // connected: the token field stays folded until "Change token"
+  const [tokenEditing, setTokenEditing] = useState(false);
+  const [disconnectArmed, setDisconnectArmed] = useState(false);
+  const [imageQuery, setImageQuery] = useState<ImageQuery | null>(null);
+  const [repoSort, setRepoSort] = useState<RepoSort>(() => {
+    const saved = localStorage.getItem("magpie.sort") as RepoSort | null;
+    return saved && SORTS.some((s) => s.id === saved) ? saved : "relevance";
+  });
+  const [webScope, setWebScopeState] = useState<WebScope>(
+    () => (localStorage.getItem("magpie.webscope") as WebScope) || "all",
+  );
+  const [localScope, setLocalScope] = useState<LocalScope>(() => {
+    const saved = localStorage.getItem("magpie.scope") as LocalScope | null;
+    return saved && SCOPES.some((s) => s.id === saved) ? saved : "all";
+  });
+  const [theme, setTheme] = useState<Theme>(() => {
+    const saved = localStorage.getItem("magpie.theme") as Theme | null;
+    return saved && THEMES.includes(saved) ? saved : "auto";
+  });
+  const [langPref, setLangPref] = useState<LangPref>(loadLangPref);
+  const [hideOnBlur, setHideOnBlur] = useState(loadHideOnBlur);
+  const hideOnBlurRef = useRef(hideOnBlur);
+  hideOnBlurRef.current = hideOnBlur;
+  const [tabKeys, setTabKeys] = useState(loadTabKeys);
+  const tabKeysRef = useRef(tabKeys);
+  tabKeysRef.current = tabKeys;
+  // launch at login: the OS registration is the truth, so it's read back
+  // from the backend rather than remembered here (null = not known yet)
+  const [autostart, setAutostart] = useState<boolean | null>(null);
+  // bumped when the backend re-reads app icons; keys the icon components so
+  // rows already on screen fetch the fresh ones
+  const [iconEpoch, setIconEpoch] = useState(0);
+  // a short-lived line in the footer: an action's progress or outcome
+  const [notice, setNotice] = useState<string | null>(null);
+  const [needsAccess, setNeedsAccess] = useState(false);
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 4000);
+    return () => clearTimeout(t);
+  }, [notice]);
+  // the row (hitKey) whose risky action is waiting for a second Enter
+  const [armed, setArmed] = useState<string | null>(null);
+  const armedRef = useRef(armed);
+  armedRef.current = armed;
+  // the action menu (Ctrl/Cmd+K) of the selected row, and its cursor
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const [actionSel, setActionSel] = useState(0);
+  const actionsOpenRef = useRef(actionsOpen);
+  actionsOpenRef.current = actionsOpen;
+
+  // language: update the module-level dictionary BEFORE the re-render, then
+  // tell the backend so the tray menu follows
+  const chooseLang = useCallback((p: LangPref) => {
+    setLang(resolveLang(p));
+    localStorage.setItem("magpie.lang", p);
+    setLangPref(p);
+    invoke("set_ui_lang", { lang: resolveLang(p) }).catch(() => {});
+  }, []);
+
+  // clips whose masked secret the user chose to see (issue #6). Masked again
+  // as soon as the palette loses focus.
+  const [revealed, setRevealed] = useState<ReadonlySet<number>>(() => new Set());
+  const toggleReveal = useCallback((id: number) => {
+    setRevealed((s) => {
+      const n = new Set(s);
+      if (!n.delete(id)) n.add(id);
+      return n;
+    });
+  }, []);
+  const clipShown = useCallback(
+    (c: ClipHit) => (c.masked != null && !revealed.has(c.id) ? c.masked : c.content),
+    [revealed],
+  );
+
+  // app alias rules ("proxy = clash", one per line); saved to the backend,
+  // which re-attaches aliases to the in-memory app list
+  const [aliasDraft, setAliasDraft] = useState<string | null>(null);
+  const [aliasMsg, setAliasMsg] = useState<string | null>(null);
+
+  // preview pane: → opens (cursor at end of input), ← closes; the selected
+  // hit's content renders beside the list. Backend data only for kinds whose
+  // content is not already in the hit (file text/image, video shots, repo).
+  const [previewOpen, setPreviewOpen] = useState(false);
+  // Whether the palette is on screen, and how many times it has been summoned.
+  // Out of sight nothing on it should tick; each summon starts the tips afresh
+  // (#13: the first tip could go within a second of opening).
+  const [paletteShown, setPaletteShown] = useState(true);
+  const [summons, setSummons] = useState(0);
+  // set by the first hide or summon, after which the startup read is stale
+  const paletteEventSeen = useRef(false);
+  // What goes when the palette is put away, by the page (hidePalette) or by
+  // the backend (hide_palette, which says "palette-hidden"): one list for
+  // both. The preview is for checking a find, not a mode (#13): it closes once
+  // the window is out of sight, so the next summon starts without it and the
+  // narrowing is never seen.
+  const onPaletteHidden = useCallback(() => {
+    paletteEventSeen.current = true;
+    setPaletteShown(false);
+    setPreviewOpen(false);
+    setWsNaming(null); // an unnamed new workspace is dropped with the palette
+    setScriptOut(null);
+  }, []);
+  const hidePalette = useCallback(async () => {
+    await getCurrentWindow().hide();
+    onPaletteHidden();
+  }, [onPaletteHidden]);
+  // the window starts hidden (a launch at login is never summoned at once)
+  useEffect(() => {
+    void getCurrentWindow()
+      .isVisible()
+      .then((v) => {
+        if (v === false && !paletteEventSeen.current) setPaletteShown(false);
+      })
+      .catch(() => {});
+  }, []);
+
+  // sync the tray language once at startup ("auto" resolves per OS locale)
+  useEffect(() => {
+    invoke("set_ui_lang", { lang: resolveLang(loadLangPref()) }).catch(() => {});
+  }, []);
+  const [hotkeyDraft, setHotkeyDraft] = useState("");
+  const [hotkeyMsg, setHotkeyMsg] = useState<string | null>(null);
+
+  // theme: auto follows the system; light/dark force via data attribute
+  useEffect(() => {
+    if (theme === "auto") {
+      delete document.documentElement.dataset.theme;
+    } else {
+      document.documentElement.dataset.theme = theme;
+    }
+    localStorage.setItem("magpie.theme", theme);
+  }, [theme]);
+
+  // query-box extras: inline calculator, bang web shortcuts, emoji lookup.
+  // topRowActive = Enter targets the calc/bang row until the user arrows
+  // down into the normal result list (reset on every query change).
+  const [calcHit, setCalcHit] = useState<CalcHit | null>(null);
+  const [bangHit, setBangHit] = useState<BangMatch | null>(null);
+  // `note …`: Enter appends the text to the notes file instead of searching
+  const [noteHit, setNoteHit] = useState<NoteMatch | null>(null);
+  // workspaces (workspace.rs): the list for the "Add to workspace" actions,
+  // and the item waiting for a new workspace's name while the box asks for it
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const loadWorkspaces = useCallback(
+    () => invoke<Workspace[]>("list_workspaces").then(setWorkspaces).catch(() => {}),
+    [],
+  );
+  useEffect(() => {
+    void loadWorkspaces();
+  }, [loadWorkspaces]);
+  const [wsNaming, setWsNaming] = useState<WsItem | null>(null);
+  // a full-output script's answer, shown in place of the list until the
+  // query changes or Esc
+  const [scriptOut, setScriptOut] = useState<{ title: string; out: ScriptOutput } | null>(null);
+  useEffect(() => setScriptOut(null), [query]);
+  const [recentsOn, setRecentsOn] = useState(recentsEnabled);
+  const [recallOn, setRecallOn] = useState(recallEnabled);
+  // the date in the empty search box (#13), fetched each time the box empties
+  const [todayOn, setTodayOn] = useState(todayLineEnabled);
+  const [todayLine, setTodayLine] = useState<TodayLine | null>(null);
+  // the scripts folder (scripts.rs) and how many commands it holds
+  const [scriptsInfo, setScriptsInfo] = useState<{ dir: string; custom: boolean; count: number } | null>(null);
+  const loadScriptsInfo = useCallback(
+    () =>
+      invoke<{ dir: string; custom: boolean; count: number }>("scripts_folder")
+        .then(setScriptsInfo)
+        .catch(() => {}),
+    [],
+  );
+  useEffect(() => {
+    if (showSettings) void loadScriptsInfo();
+  }, [showSettings, loadScriptsInfo]);
+  // pinned folders (pins.rs), as the settings page lists and edits them
+  const [pinnedFolders, setPinnedFolders] = useState<string[]>([]);
+  useEffect(() => {
+    if (showSettings) void invoke<string[]>("get_pinned_folders").then(setPinnedFolders).catch(() => {});
+  }, [showSettings]);
+  const savePins = useCallback(async (paths: string[]) => {
+    try {
+      setPinnedFolders(await invoke<string[]>("set_pinned_folders", { paths }));
+    } catch (e) {
+      setLastError(String(e));
+    }
+  }, []);
+  // settings drafts for the selection-search chord and the notes file
+  const [selDraft, setSelDraft] = useState("");
+  const [selMsg, setSelMsg] = useState<string | null>(null);
+  const [notePathDraft, setNotePathDraft] = useState("");
+  const [noteMsg, setNoteMsg] = useState<string | null>(null);
+  const [mcpMsg, setMcpMsg] = useState<string | null>(null);
+  const [emojiHits, setEmojiHits] = useState<EmojiHit[] | null>(null);
+  const [topRowActive, setTopRowActive] = useState(true);
+  const [bangsDraft, setBangsDraft] = useState<string | null>(null);
+  // a fresh discoverability tip on every summon; the row lives only in the
+  // empty state, so typing anything replaces it with results
+  const [tip, setTip] = useState(randomTip);
+  const [showTips, setShowTips] = useState(tipsEnabled);
+  // "in" while a tip is settling, "out" during the hand-off to the next one
+  const [tipPhase, setTipPhase] = useState<"in" | "out">("in");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  // monotonic search ticket; see runSearch
+  const searchSeqRef = useRef(0);
+  const listRef = useRef<HTMLDivElement>(null);
+  const queryRef = useRef(query);
+  queryRef.current = query;
+  const sourceRef = useRef(sourceIdx);
+  sourceRef.current = sourceIdx;
+  const needsTokenRef = useRef(false);
+  const imageQueryRef = useRef<ImageQuery | null>(null);
+  imageQueryRef.current = imageQuery;
+  const showSettingsRef = useRef(showSettings);
+  showSettingsRef.current = showSettings;
+
+  const source = (sources[sourceIdx] ?? sources[0]).id;
+  // Web: a faint "⌘⏎ search in browser" right after the typed text (#5),
+  // placed by measuring the text in the input's own font; hidden when it
+  // would not fit before the input's end
+  const showWebHint = source === "web" && !imageQuery && query.trim() !== "";
+  const queryHintRef = useRef<HTMLSpanElement>(null);
+  const [settingsTab, setSettingsTab] = useState<SettingsSection>("general");
+  const requestedSettingsTab = useRef<SettingsSection | null>(null);
+  const settingsPageRef = useRef<HTMLDivElement>(null);
+  // opening settings lands on the current tab's page (only on opening: a
+  // tab switch behind the open settings must not move its page)
+  useEffect(() => {
+    if (showSettings) {
+      setSettingsTab(requestedSettingsTab.current ?? SECTION_FOR_SOURCE[source] ?? "general");
+      requestedSettingsTab.current = null;
+    }
+  }, [showSettings]);
+  // a new page starts at its top
+  useEffect(() => {
+    settingsPageRef.current?.scrollTo({ top: 0 });
+  }, [settingsTab]);
+  // the app icons the backend already holds, into the palette's cache
+  useEffect(() => {
+    void loadAppIcons().then(() => setIconEpoch((n) => n + 1));
+  }, []);
+  // installed editors for the action menu's "Open in …": read at start and
+  // each time the menu opens, so an editor installed meanwhile shows up
+  const [editors, setEditors] = useState<{ name: string; target: string }[]>([]);
+  useEffect(() => {
+    invoke<{ name: string; target: string }[]>("installed_editors")
+      .then(setEditors)
+      .catch(() => {});
+  }, [actionsOpen]);
+  // "Edit with" (#14): the table and the apps it can name, read at start,
+  // when the action menu opens (its label names the app) and when settings
+  // open (an app installed meanwhile can be picked)
+  const [editRules, setEditRules] = useState<EditRule[]>([]);
+  const [appChoices, setAppChoices] = useState<{ name: string; target: string }[]>([]);
+  useEffect(() => {
+    invoke<EditRule[]>("get_edit_rules").then(setEditRules).catch(() => {});
+    invoke<{ name: string; target: string }[]>("app_choices").then(setAppChoices).catch(() => {});
+  }, [actionsOpen, showSettings]);
+  const saveEditRules = useCallback(async (rules: EditRule[]) => {
+    try {
+      setEditRules(await invoke<EditRule[]>("set_edit_rules", { rules }));
+      setLastError(null);
+    } catch (e) {
+      setLastError(String(e));
+    }
+  }, []);
+  /// the name of the app a file's type is set to open in, if any
+  const editAppName = useCallback(
+    (path: string): string | null => {
+      const ext = /\.([^.\\/]+)$/.exec(path)?.[1]?.toLowerCase();
+      const rule = ext ? editRules.find((r) => r.app && r.exts.includes(ext)) : undefined;
+      return rule ? (appChoices.find((a) => a.target === rule.app)?.name ?? null) : null;
+    },
+    [editRules, appChoices],
+  );
+  const editFile = useCallback(async (path: string) => {
+    try {
+      // the backend hides the palette once the app is on its way
+      const said = await invoke<string>("edit_file", { path });
+      if (said.startsWith("dry run")) setNotice(said);
+    } catch (e) {
+      setLastError(String(e));
+    }
+  }, []);
+  // Settings › Web: the browsers found and what each contributed
+  const [webSources, setWebSources] = useState<WebSource[] | null>(null);
+  const loadWebSources = useCallback(() => {
+    invoke<WebSource[]>("web_sources")
+      .then(setWebSources)
+      .catch(() => setWebSources([]));
+  }, []);
+  useEffect(() => {
+    if (showSettings && settingsTab === "web") loadWebSources();
+  }, [showSettings, settingsTab, loadWebSources]);
+  useEffect(() => {
+    const un = listen("bookmarks-done", () => loadWebSources());
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [loadWebSources]);
+  // how many footer hints gave way so the status fits (see footerHints)
+  const [hintsDropped, setHintsDropped] = useState(0);
+  const [, setFontsTick] = useState(0);
+  const footerStatusRef = useRef<HTMLSpanElement>(null);
+  const [queryHintLeft, setQueryHintLeft] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    const hint = queryHintRef.current;
+    if (!showWebHint || !input || !hint) {
+      setQueryHintLeft(null);
+      return;
+    }
+    const cs = getComputedStyle(input);
+    const ctx = measureCanvas().getContext("2d");
+    if (!ctx) return;
+    ctx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+    const left = input.offsetLeft + parseFloat(cs.paddingLeft || "0") + ctx.measureText(query).width - input.scrollLeft + 14;
+    const fits = left + hint.offsetWidth <= input.offsetLeft + input.clientWidth;
+    setQueryHintLeft(fits ? left : null);
+  }, [query, showWebHint]);
+  const needsToken = source === "github-stars" && status !== null && !status.has_token;
+  needsTokenRef.current = status !== null && !status.has_token;
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      setStatus(await invoke<Status>("get_status"));
+    } catch {
+      /* backend not ready yet */
+    }
+  }, []);
+
+  const refreshFolders = useCallback(async () => {
+    try {
+      setFolders(await invoke<FolderInfo[]>("list_folders"));
+      setFoldersFailed(false);
+    } catch (e) {
+      // surfaced in settings; a silent failure here looks like "no folders"
+      setFoldersFailed(true);
+      setLastError(`folder list failed: ${String(e)}`);
+    }
+  }, []);
+
+  const saveAliases = useCallback(
+    async (text: string) => {
+      try {
+        await invoke("set_app_aliases", { text });
+        setAliasMsg("saved");
+        setAliasDraft(null);
+        await refreshStatus();
+      } catch (e) {
+        setAliasMsg(String(e));
+      }
+    },
+    [refreshStatus],
+  );
+
+  // opening settings always shows fresh state
+  useEffect(() => {
+    if (showSettings) {
+      refreshStatus();
+      refreshFolders();
+      invoke<boolean>("get_autostart")
+        .then((on) => setAutostart(!!on))
+        .catch(() => setAutostart(null));
+    }
+  }, [showSettings, refreshStatus, refreshFolders]);
+
+  const repoSortRef = useRef(repoSort);
+  repoSortRef.current = repoSort;
+  const localScopeRef = useRef(localScope);
+  localScopeRef.current = localScope;
+  const webScopeRef = useRef(webScope);
+  webScopeRef.current = webScope;
+
+  const setScope = useCallback((s: LocalScope) => {
+    setLocalScope(s);
+    localStorage.setItem("magpie.scope", s);
+    inputRef.current?.focus();
+  }, []);
+
+  const setWebScope = useCallback((s: WebScope) => {
+    setWebScopeState(s);
+    localStorage.setItem("magpie.webscope", s);
+    inputRef.current?.focus();
+  }, []);
+
+  // the row a refresh should keep selected (refreshResults sets it, a new
+  // query clears it); runSearch selects it once it is in the list
+  const followKeyRef = useRef<string | null>(null);
+  // Search runs on each keypress. Only record a query once it has settled,
+  // to avoid persisting every partial prefix. History stays local and bounded.
+  useEffect(() => {
+    if (showSettings || indexExplorerOpen || searchHistoryOpen || imageQuery || query.trim().length < 2) return;
+    const timer = window.setTimeout(() => {
+      const src = (sourcesRef.current[sourceIdx] ?? sourcesRef.current[0]).id;
+      rememberSearch(query, src);
+      setSearchHistoryRevision(n => n + 1);
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [query, sourceIdx, showSettings, indexExplorerOpen, searchHistoryOpen, imageQuery]);
+
+  const runSearch = useCallback(async (q: string, srcIdx: number) => {
+    // where the selection goes with a new list: the followed row if it is
+    // there, else the top. Always handed a whole list (a followed local
+    // search paints only once every part is in), so a row missing is gone.
+    const pick = (list: Hit[]): number => {
+      const k = followKeyRef.current;
+      followKeyRef.current = null;
+      if (k == null) return 0;
+      return Math.max(0, list.findIndex((h) => hitKey(h) === k));
+    };
+    const show = (list: Hit[]) => {
+      setResults(list);
+      setSelected(pick(list));
+      setSelAnchor(null);
+    };
+    // one ticket per search: only the latest request may publish results. The
+    // backend cancels the superseded query outright (see take_search_conn);
+    // this guard covers the tail where an older response is already in flight.
+    const seq = ++searchSeqRef.current;
+    // empty input shows nothing: the palette stays a bare search box.
+    // Clipboard is the exception — its whole point is "what did I just copy",
+    // so an empty query lists the most recent clips.
+    const srcId = (sourcesRef.current[srcIdx] ?? sourcesRef.current[0]).id;
+    // `dl` / `最近下载`: the newest files in the Downloads folder
+    if (/^(dl|最近下载)$/i.test(q.trim())) {
+      try {
+        const fs = await invoke<Hit[]>("recent_downloads");
+        if (seq === searchSeqRef.current && sourceRef.current === srcIdx) {
+          show(fs);
+        }
+      } catch (e) {
+        setLastError(String(e));
+      }
+      return;
+    }
+    // `port 3000` (or `kill :3000`) lists what listens on that port
+    const portQ = matchPort(q);
+    if (portQ !== null) {
+      try {
+        const ps = await invoke<Omit<ProcessHit, "kind">[]>("list_port_processes", { port: portQ });
+        if (seq === searchSeqRef.current && sourceRef.current === srcIdx) {
+          show(ps.map((p) => ({ ...p, kind: "process" as const })));
+        }
+      } catch (e) {
+        setLastError(String(e));
+      }
+      return;
+    }
+    // `top` / `内存` (by memory) and `cpu` (by CPU): the heaviest processes,
+    // from any tab; Enter twice ends one, as with `kill`. Only the words
+    // the docs name: each one takes that search away from files
+    const topQ = /^(top|内存|cpu)$/i.exec(q.trim());
+    if (topQ) {
+      try {
+        const by = /^cpu$/i.test(topQ[1]) ? "cpu" : "memory";
+        const ps = await invoke<Omit<ProcessHit, "kind">[]>("top_processes", { by });
+        if (seq === searchSeqRef.current && sourceRef.current === srcIdx) {
+          show(ps.map((p) => ({ ...p, kind: "process" as const })));
+        }
+      } catch (e) {
+        setLastError(String(e));
+      }
+      return;
+    }
+    // `kill <name>` lists running processes, from any tab
+    const killQ = matchKill(q);
+    if (killQ) {
+      try {
+        const ps = await invoke<Omit<ProcessHit, "kind">[]>("list_processes", { query: killQ });
+        if (seq === searchSeqRef.current && sourceRef.current === srcIdx) {
+          show(ps.map((p) => ({ ...p, kind: "process" as const })));
+        }
+      } catch {
+        /* listing failed: keep what is on screen */
+      }
+      return;
+    }
+    // the date in the empty box, on every tab: read fresh, so it turns over
+    // at midnight
+    if (q.trim() === "" && todayLineEnabled()) {
+      void invoke<TodayLine>("today_line").then(setTodayLine).catch(() => setTodayLine(null));
+    }
+    if (q.trim() === "" && srcId !== "clips") {
+      const mainTab = srcId === "local" || srcId === "github-stars" || srcId === "web";
+      // opt-in: the empty box lists what you opened most recently from this
+      // tab, so "back to that file from a minute ago" is two keystrokes
+      const wantRecents = recentsEnabled() && mainTab;
+      // off unless turned on: today's cards from long ago (recall.rs)
+      const wantRecall = recallEnabled() && mainTab;
+      // the folders the user pinned, first on the local tab (pins.rs)
+      const wantPins = srcId === "local";
+      if (wantRecents || wantRecall || wantPins) {
+        const [pins, recall, recents] = await Promise.all([
+          wantPins ? invoke<Hit[]>("pinned_rows").catch(() => []) : Promise.resolve([]),
+          wantRecall ? invoke<Hit[]>("recall_today", { source: srcId }).catch(() => []) : Promise.resolve([]),
+          wantRecents ? invoke<Hit[]>("recent_hits", { source: srcId }).catch(() => null) : Promise.resolve([]),
+        ]);
+        if (seq === searchSeqRef.current && sourceRef.current === srcIdx) {
+          // a failed recent list keeps the bare box, as before the cards
+          const list = Array.isArray(recents) ? recents : [];
+          const cards = Array.isArray(recall) ? recall : [];
+          // the same page bookmarked twice has two row ids: compare addresses
+          const same = (a: Hit, b: Hit) =>
+            a.kind === "bookmark" && b.kind === "bookmark" ? a.url === b.url : hitKey(a) === hitKey(b);
+          show([...(Array.isArray(pins) ? pins : []), ...cards, ...list.filter((h) => !cards.some((c) => same(h, c)))]);
+        }
+        return;
+      }
+      setResults([]);
+      setSelected(0);
+      return;
+    }
+    try {
+      let hits: Hit[];
+      if (srcId === "github-stars") {
+        const rs = await invoke<Omit<RepoHit, "kind">[]>("search_stars", {
+          query: q,
+          sort: repoSortRef.current,
+        });
+        hits = rs.map((r) => ({ ...r, kind: "repo" as const }));
+      } else if (srcId === "web") {
+        // backend already tags each hit's kind ("bookmark" | "history")
+        hits = await invoke<Hit[]>("search_web", {
+          query: q,
+          scope: webScopeRef.current,
+        });
+      } else if (srcId === "clips") {
+        const cs = await invoke<Omit<ClipHit, "kind">[]>("search_clips", { query: q });
+        hits = cs.map((c) => ({ ...c, kind: "clip" as const }));
+      } else {
+        // local: apps, system commands and files are asked for at once and
+        // each is shown the moment it answers. Apps and commands are matched
+        // in memory; the file search embeds the query (two models when the
+        // image model is loaded) and can take a while on a busy machine, so
+        // it must never hold the others back.
+        const live = () => seq === searchSeqRef.current && sourceRef.current === srcIdx;
+        let apps: Hit[] | null = null;
+        let cmds: Hit[] | null = null;
+        let wss: Hit[] | null = null;
+        let scs: Hit[] | null = null;
+        let files: Hit[] | null = null;
+        let painted = false;
+        let shown: Hit[] | null = null; // the list this search last handed to React
+        const paint = () => {
+          if (!live()) return;
+          // workspaces, scripts, system commands and apps share one scale;
+          // the better match leads (a stable sort: the earlier kind wins a tie)
+          const top = [...(wss ?? []), ...(scs ?? []), ...(cmds ?? []), ...(apps ?? [])].sort(
+            (a, b) => (b as { score: number }).score - (a as { score: number }).score,
+          );
+          const list = [...top, ...(files ?? [])];
+          const allIn = apps !== null && cmds !== null && wss !== null && scs !== null && files !== null;
+          // nothing to show yet: keep the previous list rather than blank it
+          if (list.length === 0 && !allIn) return;
+          // a refresh keeps the list on screen until all of it is in, so the
+          // followed row never jumps to the top in between
+          if (followKeyRef.current != null && !allIn) return;
+          if (!painted) {
+            painted = true;
+            shown = list;
+            show(list);
+            return;
+          }
+          // later parts: the first row stays selected unless the user moved;
+          // a row they picked stays picked wherever it lands. Until our last
+          // list is on screen the selection still belongs to the one before
+          // it (another query's), so it is not carried over.
+          const onScreen = resultsRef.current === shown;
+          const was = onScreen ? selectedRef.current : 0;
+          const key = was > 0 && resultsRef.current[was] ? hitKey(resultsRef.current[was]) : null;
+          shown = list;
+          setResults(list);
+          if (key) {
+            const i = list.findIndex((h) => hitKey(h) === key);
+            setSelected(i >= 0 ? i : 0);
+          } else {
+            setSelected(0);
+          }
+        };
+        await Promise.all([
+          invoke<Omit<AppHit, "kind">[]>("search_apps", { query: q, pinyin: false })
+            .catch(() => [] as Omit<AppHit, "kind">[])
+            .then((a) => {
+              apps = a.map((x) => ({ ...x, kind: "app" as const }));
+              paint();
+              // icons of the apps on screen: re-read in the background if an
+              // app changed since its icon was cached; never waited on
+              if (a.length > 0 && live()) {
+                void invoke("refresh_app_icons", { targets: a.map((x) => x.target) }).catch(() => {});
+              }
+            }),
+          invoke<Omit<CommandHit, "kind">[]>("search_commands", { query: q })
+            .catch(() => [] as Omit<CommandHit, "kind">[])
+            .then((c) => {
+              cmds = c.map((x) => ({ ...x, kind: "command" as const }));
+              paint();
+            }),
+          invoke<Omit<ScriptHit, "kind">[]>("search_scripts", { query: q })
+            .catch(() => [] as Omit<ScriptHit, "kind">[])
+            .then((s) => {
+              scs = s.map((x) => ({ ...x, kind: "script" as const }));
+              paint();
+            }),
+          invoke<Omit<WorkspaceHit, "kind">[]>("search_workspaces", { query: q })
+            .catch(() => [] as Omit<WorkspaceHit, "kind">[])
+            .then((w) => {
+              wss = w.map((x) => ({ ...x, kind: "workspace" as const }));
+              paint();
+            }),
+          invoke<Hit[]>("search_local", { query: q, scope: localScopeRef.current })
+            .catch(() => [] as Hit[])
+            .then((f) => {
+              files = f;
+              paint();
+            }),
+        ]);
+        return;
+      }
+      if (seq === searchSeqRef.current && sourceRef.current === srcIdx) {
+        show(hits);
+      }
+    } catch {
+      /* transient: db busy during migration */
+    }
+  }, []);
+
+  // A refresh of the query on screen (an index pass finished, a clip was
+  // pinned, a process ended): the list may change under the user, the
+  // selection should not. The row selected now stays selected wherever it
+  // lands (runSearch picks it, see followKeyRef); a new query or tab still
+  // starts at the top, since the query effect forgets the row.
+  const refreshResults = useCallback(() => {
+    // an image search on screen is no text query: re-running the (empty)
+    // text query would wipe its results
+    if (imageQueryRef.current) return Promise.resolve();
+    const cur = resultsRef.current[selectedRef.current];
+    followKeyRef.current = cur ? hitKey(cur) : null;
+    return runSearch(queryRef.current, sourceRef.current);
+  }, [runSearch]);
+
+  // Voice search is opt-in per recording. Never record in the background.
+  const [voiceMode, setVoiceMode] = useState<"idle" | "starting" | "recording" | "transcribing">("idle");
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [voicePreview, setVoicePreview] = useState("");
+  const voiceCaptureRef = useRef<VoiceCapture | null>(null);
+
+  useEffect(() => () => {
+    const capture = voiceCaptureRef.current;
+    voiceCaptureRef.current = null;
+    if (capture) releaseVoiceCapture(capture);
+  }, []);
+
+  // FluidVoice 1.6.9 exposes batch transcription, not a streaming endpoint.
+  // Send occasional complete snapshots while recording, never concurrently.
+  // These are provisional: the FINAL full-recording result is authoritative.
+  const updateVoicePreview = useCallback(async (capture: VoiceCapture) => {
+    if (voiceCaptureRef.current !== capture || capture.previewBusy || capture.previewRequests >= 9) return;
+    // A 2-second timer tick may arrive before exactly two seconds of PCM data.
+    if (capture.sampleCount < capture.sampleRate * 1.5) return;
+    if (capture.sampleCount - capture.previewSampleCount < capture.sampleRate * 1.5) return;
+    capture.previewBusy = true;
+    capture.previewRequests += 1;
+    capture.previewSampleCount = capture.sampleCount;
+    try {
+      // Snapshot before awaiting: audio frames continue arriving independently.
+      const frames = capture.frames.slice();
+      const samples = capture.sampleCount;
+      const audioB64 = voiceWavBase64(frames, samples, capture.sampleRate);
+      const provisional = (await invoke<string>("transcribe_fluidvoice", { audioB64 })).trim();
+      if (voiceCaptureRef.current === capture && provisional) {
+        setVoicePreview(provisional);
+      }
+    } catch {
+      // A transient preview failure must never interrupt recording or final ASR.
+    } finally {
+      capture.previewBusy = false;
+    }
+  }, []);
+
+  const stopVoiceCapture = useCallback(async () => {
+    const capture = voiceCaptureRef.current;
+    if (!capture) return;
+    voiceCaptureRef.current = null;
+    releaseVoiceCapture(capture);
+    setVoiceMode("transcribing");
+    try {
+      if (capture.sampleCount < capture.sampleRate / 5) {
+        throw new Error("Запись слишком короткая. Повтори запрос.");
+      }
+      const audioB64 = voiceWavBase64(capture.frames, capture.sampleCount, capture.sampleRate);
+      // Do not run final ASR concurrently with a pending preview request.
+      // Its failure was already handled as an optional preview.
+      if (capture.previewTask) await capture.previewTask;
+      const text = (await invoke<string>("transcribe_fluidvoice", { audioB64 })).trim();
+      if (!text) throw new Error("FluidVoice не распознал речь.");
+      setVoiceError(null);
+      setImageQuery(null);
+      const localIdx = sourcesRef.current.findIndex((s) => s.id === "local");
+      if (localIdx >= 0) setSourceIdx(localIdx);
+      setQuery(text);
+      setVoicePreview("");
+      inputRef.current?.focus();
+    } catch (e) {
+      setVoiceError(String(e).replace(/^Error:\s*/, ""));
+    } finally {
+      setVoiceMode("idle");
+      setVoicePreview("");
+    }
+  }, []);
+
+  const startVoiceCapture = useCallback(async () => {
+    if (voiceCaptureRef.current) return;
+    setVoiceError(null);
+    setVoicePreview("");
+    setVoiceMode("starting");
+    let stream: MediaStream | null = null;
+    let context: AudioContext | null = null;
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("Микрофон недоступен в этом окне macOS.");
+      }
+      stream = await holdOpen(() => navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        video: false,
+      }));
+      context = new AudioContext();
+      await context.resume();
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      const silent = context.createGain();
+      silent.gain.value = 0;
+      const capture: VoiceCapture = {
+        stream, context, source, processor, silent,
+        frames: [], sampleCount: 0,
+        sampleRate: Math.round(context.sampleRate),
+        timeout: 0,
+        previewTimer: 0,
+        previewBusy: false,
+        previewSampleCount: 0,
+        previewRequests: 0,
+        previewTask: null,
+      };
+      voiceCaptureRef.current = capture;
+      processor.onaudioprocess = (event) => {
+        if (voiceCaptureRef.current !== capture) return;
+        const pcm = new Float32Array(event.inputBuffer.getChannelData(0));
+        capture.frames.push(pcm);
+        capture.sampleCount += pcm.length;
+      };
+      source.connect(processor);
+      processor.connect(silent);
+      silent.connect(context.destination);
+      // ~2 s cadence, at most nine provisional ASR requests per 20 s recording.
+      // A slow request blocks the next preview; final ASR waits for the last one.
+      capture.previewTimer = window.setInterval(() => {
+        if (!capture.previewBusy) capture.previewTask = updateVoicePreview(capture);
+      }, 2_000);
+      capture.timeout = window.setTimeout(() => { void stopVoiceCapture(); }, 20_000);
+      setVoiceMode("recording");
+    } catch (e) {
+      if (voiceCaptureRef.current) {
+        releaseVoiceCapture(voiceCaptureRef.current);
+        voiceCaptureRef.current = null;
+      } else {
+        stream?.getTracks().forEach((track) => track.stop());
+        if (context) void context.close().catch(() => {});
+      }
+      setVoiceError(String(e).replace(/^Error:\s*/, ""));
+      setVoiceMode("idle");
+    }
+  }, [stopVoiceCapture, updateVoicePreview]);
+
+  const acceptImageQuery = useCallback((iq: ImageQuery) => {
+    setQuery("");
+    setImageQuery(iq);
+    setSourceIdx(0); // images live in the local source
+    setShowSettings(false);
+    inputRef.current?.focus();
+  }, []);
+
+  // tips rotate only while the empty state is on screen: typing, opening
+  // settings, or dropping an image stops the timer instead of burning one
+  // in the background
+  const tipsIdle = showTips && !showSettings && query.trim() === "" && !imageQuery;
+  // and only while the palette is: hidden, the line stays as it is (the
+  // window's height follows its content) but nothing ticks; a summon starts
+  // a fresh 8 s
+  const tipsTicking = tipsIdle && paletteShown;
+  // today's date sits inside the empty search box, on its right (#13)
+  const todayShown = todayOn && todayLine != null && !showSettings && query.trim() === "" && !imageQuery && !wsNaming;
+  useEffect(() => {
+    if (!tipsTicking) {
+      // leaving the empty state mid-hand-off would strand the phase on
+      // "out", and the next tip would render already fading away
+      setTipPhase("in");
+      return;
+    }
+    const OUT_MS = 140;
+    const iv = setInterval(() => {
+      setTipPhase("out");
+      setTimeout(() => {
+        // on the first day of a solar term its couplet takes every other turn
+        setTip((previous) => nextTip(previous));
+        setTipPhase("in");
+      }, OUT_MS);
+    }, 8000);
+    return () => clearInterval(iv);
+  }, [tipsTicking, summons]);
+
+  // extras react to the raw query synchronously (they're cheap and local)
+  useEffect(() => {
+    setTopRowActive(true);
+    const q = query.trim();
+    if (q.startsWith(":")) {
+      setEmojiHits(searchEmoji(q.slice(1)));
+      setCalcHit(null);
+      setBangHit(null);
+      setNoteHit(null);
+      return;
+    }
+    setEmojiHits(null);
+    setNoteHit(matchNote(q));
+    setBangHit(matchBang(q, loadBangs()));
+    if (/^diff$/i.test(q)) {
+      // the last two copies, line by line; read once, not per keystroke
+      let live = true;
+      setCalcHit(null);
+      invoke<CalcHit>("clip_diff")
+        .then((r) => {
+          if (!live) return;
+          if (r.error) {
+            setCalcHit({ ...r, value: CALC_MESSAGES.includes(r.value) ? t(r.value) : r.value });
+            return;
+          }
+          const d = r.diff ?? [];
+          const added = d.filter(([k]) => k === "+").length;
+          const removed = d.filter(([k]) => k === "-").length;
+          setCalcHit({ ...r, alt: tf("diff · {r} removed, {a} added", { r: removed, a: added }) });
+        })
+        .catch((e) => live && setCalcHit({ value: String(e), alt: "diff", error: true }));
+      return () => {
+        live = false;
+      };
+    }
+    if (/^(timer|timers|倒计时)$/i.test(q)) {
+      // the countdowns running now; Enter stops them
+      let live = true;
+      setCalcHit(null);
+      invoke<{ id: number; label: string; ends_at: number }[]>("list_timers")
+        .then((ts) => {
+          if (!live) return;
+          if (ts.length === 0) {
+            setCalcHit({ value: t("No timer running. Try timer 25m"), alt: null, error: true });
+            return;
+          }
+          const now = Date.now();
+          setCalcHit({
+            value: ts.map((x) => `${clock((x.ends_at - now) / 1000)} ${x.label}`).join(" · "),
+            alt: tf("{n} running · Enter stops them all", { n: ts.length }),
+            timerIds: ts.map((x) => x.id),
+          });
+        })
+        .catch(() => {});
+      return () => {
+        live = false;
+      };
+    }
+    if (/^(ocr|取字)$/i.test(q)) {
+      // the text in the image on the clipboard; read once, not per keystroke
+      let live = true;
+      setCalcHit(null);
+      invoke<CalcHit>("ocr_clipboard")
+        .then((r) => {
+          if (!live) return;
+          setCalcHit(
+            r.error
+              ? { ...r, value: OCR_MESSAGES.includes(r.value) ? t(r.value) : r.value }
+              : { ...r, alt: tf("Text in the copied image · {n} lines", { n: r.value.split("\n").length }) },
+          );
+        })
+        .catch((e) => live && setCalcHit({ value: String(e), alt: "ocr", error: true } as CalcHit));
+      return () => {
+        live = false;
+      };
+    }
+    if (q.length >= 2) {
+      // answers take different times (a network path, the audio device):
+      // a late one for an older query must not replace the current row,
+      // or Enter would act on what is no longer typed
+      let live = true;
+      invoke<CalcHit | null>("calc_query", { query: q })
+        .then((r) => live && setCalcHit(r ? { ...r, forQuery: q } : null))
+        .catch(() => live && setCalcHit(null));
+      return () => {
+        live = false;
+      };
+    } else {
+      setCalcHit(null);
+    }
+  }, [query]);
+
+  // live search, debounced; an active image query searches by similarity instead
+  useEffect(() => {
+    if (imageQuery) {
+      invoke<Hit[]>("search_by_image", {
+        path: imageQuery.path ?? null,
+        bytesB64: imageQuery.bytesB64 ?? null,
+      })
+        .then((hits) => {
+          if (imageQueryRef.current !== imageQuery) return; // stale
+          setResults(hits);
+          setSelected(0);
+          setLastError(null);
+        })
+        .catch((e) => setLastError(String(e)));
+      return;
+    }
+    followKeyRef.current = null;
+    const t = setTimeout(() => runSearch(query, sourceIdx), 120);
+    return () => clearTimeout(t);
+  }, [query, sourceIdx, imageQuery, repoSort, localScope, webScope, runSearch]);
+
+  // release blob preview URLs when the image query changes or clears
+  useEffect(() => {
+    const src = imageQuery?.thumbSrc;
+    return () => {
+      if (src?.startsWith("blob:")) URL.revokeObjectURL(src);
+    };
+  }, [imageQuery]);
+
+  // paste an image from the clipboard to search by it
+  useEffect(() => {
+    const onPaste = async (e: ClipboardEvent) => {
+      const item = Array.from(e.clipboardData?.items ?? []).find((i) =>
+        i.type.startsWith("image/"),
+      );
+      if (!item) return;
+      e.preventDefault();
+      const file = item.getAsFile();
+      if (!file) return;
+      const buf = new Uint8Array(await file.arrayBuffer());
+      let bin = "";
+      const chunk = 0x8000;
+      for (let i = 0; i < buf.length; i += chunk) {
+        bin += String.fromCharCode(...buf.subarray(i, i + chunk));
+      }
+      acceptImageQuery({
+        label: "pasted image",
+        bytesB64: btoa(bin),
+        thumbSrc: URL.createObjectURL(file),
+      });
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [acceptImageQuery]);
+
+  // backend events
+  // suppress the native right-click menu everywhere (keyboard copy/paste
+  // still works in inputs); a launcher has no use for the browser context menu
+  useEffect(() => {
+    const block = (e: MouseEvent) => e.preventDefault();
+    document.addEventListener("contextmenu", block);
+    return () => document.removeEventListener("contextmenu", block);
+  }, []);
+
+  // Settings toggle on the WINDOW, not the panel: with settings open the
+  // input is hidden and focus can sit on <body>, so a panel-level handler
+  // would open settings but never close them. Alt+, matches the app's own
+  // Alt family; Ctrl/Cmd+, keeps the platform convention working too. The
+  // character OR the physical key matches: Option+, types "≤" on macOS (the
+  // key is still Comma), and on AZERTY the comma sits on another key (the
+  // character is still ",").
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.key === "," || e.code === "Comma") && (e.altKey || e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        setShowSettings((s) => !s);
+      } else if (e.key === "Escape" && document.activeElement === document.body) {
+        // focus fell to <body> (a click on a row, a pill, the empty strip
+        // under the list): the panel handler can't hear this Esc, so run
+        // its whole ladder here, down to hiding the palette
+        e.preventDefault();
+        if (actionsOpenRef.current) {
+          setActionsOpen(false);
+        } else if (imageQueryRef.current) {
+          setImageQuery(null);
+        } else if (showSettingsRef.current) {
+          setShowSettings(false);
+        } else {
+          // dismissed: the focus goes back where it was (#9)
+          void invoke("dismiss");
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // hide on click-out (opt-in, on by default on macOS). A short grace keeps
+  // a focus bounce while the window is being shown from hiding it again.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const un = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      clearTimeout(timer);
+      if (!focused) setRevealed((s) => (s.size ? new Set() : s));
+      if (focused || !hideOnBlurRef.current || holdOpenCount > 0) return;
+      timer = setTimeout(() => {
+        if (hideOnBlurRef.current && holdOpenCount === 0) hidePalette();
+      }, 120);
+    });
+    return () => {
+      clearTimeout(timer);
+      void un.then((f) => f());
+    };
+  }, []);
+
+  // whenever settings close (shortcut, Esc, ✕), typing must work immediately
+  useEffect(() => {
+    if (!showSettings) inputRef.current?.focus();
+  }, [showSettings]);
+
+  useEffect(() => {
+    refreshStatus();
+    refreshFolders();
+    // a tab or a query the launch that started magpie asked for
+    const applyLaunchRequest = (r: LaunchRequest | null) => {
+      if (!r || (r.source == null && r.query == null)) return;
+      setShowSettings(false);
+      setImageQuery(null);
+      if (r.source != null) {
+        const idx = sourcesRef.current.findIndex((s) => s.id === r.source);
+        if (idx >= 0) {
+          setSourceIdx(idx);
+          setSelected(0);
+        }
+      }
+      if (r.query != null) setQuery(r.query);
+    };
+    void invoke<LaunchRequest | null>("take_launch_request").then(applyLaunchRequest).catch(() => {});
+    const subs = [
+      listen<StarsProgress>("sync-progress", (e) => {
+        setStarsProgress(e.payload);
+        // a sync that runs again takes back its own earlier failure, and
+        // only that: a script's or a workspace's error stays on screen
+        const mine = syncErrorRef.current;
+        syncErrorRef.current = null;
+        if (mine != null) setLastError((cur) => (cur === mine ? null : cur));
+      }),
+      listen("sync-done", () => {
+        setStarsProgress(null);
+        refreshStatus();
+        refreshResults();
+      }),
+      listen<string>("sync-error", (e) => {
+        setStarsProgress(null);
+        syncErrorRef.current = e.payload;
+        setLastError(e.payload);
+        refreshStatus();
+      }),
+      listen<LocalProgress>("local-progress", (e) => setLocalProgress(e.payload)),
+      listen("local-done", () => {
+        setLocalProgress(null);
+        refreshStatus();
+        refreshFolders();
+        refreshResults();
+      }),
+      listen<string>("local-error", (e) => {
+        setLocalProgress(null);
+        setLastError(e.payload);
+      }),
+      listen("bookmarks-done", () => {
+        refreshStatus();
+        refreshResults();
+      }),
+      listen<string>("bookmarks-error", (e) => setLastError(e.payload)),
+      listen("model-status", () => refreshStatus()),
+      listen("embed-caught-up", () => {
+        refreshStatus();
+        refreshResults();
+      }),
+      listen("palette-hidden", onPaletteHidden),
+      listen("palette-shown", () => {
+        paletteEventSeen.current = true;
+        setPaletteShown(true);
+        setSummons((n) => n + 1);
+        // hidden by something outside magpie (the OS, another tool): the
+        // pane goes now, at the cost of a frame or two of it on screen
+        setPreviewOpen(false);
+        inputRef.current?.focus();
+        inputRef.current?.select();
+        // on the first day of a solar term the palette opens on its couplet
+        setTip(randomTip());
+        setTipPhase("in");
+        refreshStatus();
+        // an empty box is built fresh on every summon: hidden empty, it kept
+        // the last one, yesterday's date and recall cards after midnight
+        if (queryRef.current.trim() === "" && !imageQueryRef.current) void refreshResults();
+      }),
+      // drop an image file anywhere on the palette to search by it
+      getCurrentWebview().onDragDropEvent(async (e) => {
+        if (e.payload.type === "drop") {
+          const p = e.payload.paths.find((x) => IMAGE_EXT_RE.test(x));
+          if (p) {
+            const thumb = await invoke<string | null>("preview_thumb", { path: p }).catch(
+              () => null,
+            );
+            acceptImageQuery({
+              label: p.split(/[\\/]/).pop() ?? "image",
+              path: p,
+              thumbSrc: thumb ? `data:image/jpeg;base64,${thumb}` : undefined,
+            });
+          }
+        }
+      }),
+      // tray menu entry point
+      listen("open-settings", () => setShowSettings(true)),
+      // the backend re-read some app icons (new or updated apps): swap the
+      // palette's copies for the new set, then let the rows on screen redraw
+      listen("app-icons-changed", () => {
+        void loadAppIcons(true).finally(() => setIconEpoch((n) => n + 1));
+      }),
+      // the selection-search chord: the backend copied the selected text and
+      // is about to summon the palette; make that text the query
+      listen<string>("search-selection", (e) => {
+        // a copy went out, so the permission is there now
+        setNeedsAccess(false);
+        setShowSettings(false);
+        setImageQuery(null);
+        setSourceIdx(0);
+        setQuery(e.payload);
+      }),
+      // `magpie --source clips --query …` from a second launch (a key bound
+      // in a window manager, a script): open on that tab with that query
+      listen<LaunchRequest>("open-request", (e) => applyLaunchRequest(e.payload)),
+      // macOS would drop the copy chord for want of the Accessibility
+      // permission: a hint row with a button to the settings page stays
+      // until a selection search goes through or it is dismissed (#17)
+      listen("selection-needs-access", () => {
+        setShowSettings(false);
+        setNeedsAccess(true);
+      }),
+      // no hide-on-blur: the palette stays until the user dismisses it
+      // explicitly (Esc, Alt+Space, tray) — dragging files in needs the
+      // window to survive losing focus
+    ];
+    return () => {
+      subs.forEach((p) => p.then((un) => un()));
+    };
+  }, [refreshStatus, refreshFolders, refreshResults]);
+
+  // The pane renders only when there is a row to describe, so the reserved
+  // column and the wider window follow that same condition. Keying them off
+  // the open/closed flag alone leaves a blank strip when a query is cleared
+  // while the preview is open.
+  const previewShown =
+    previewOpen && !showSettings && (results.length > 0 || calcHit != null || bangHit != null);
+
+  // Step 28: an optional freely resizable search window. The normal compact
+  // palette remains the default; once the corner grip is used, the window
+  // keeps its user-defined size instead of fitting itself to eight rows.
+  const [userSized, setUserSized] = useState(() => {
+    try {
+      const data = JSON.parse(localStorage.getItem("localsearch.window-size.v1") || "null");
+      return data != null && Number.isFinite(data.width) && Number.isFinite(data.height)
+        && data.width >= 720 && data.height >= 320;
+    } catch {
+      return false;
+    }
+  });
+  const userSizedRef = useRef(userSized);
+  userSizedRef.current = userSized;
+  const restoringSizeRef = useRef(userSized);
+  useEffect(() => {
+    if (import.meta.env.VITE_DEMO) return;
+    const stored = (() => {
+      try { return JSON.parse(localStorage.getItem("localsearch.window-size.v1") || "null"); }
+      catch { return null; }
+    })();
+    if (!stored || !userSizedRef.current) {
+      restoringSizeRef.current = false;
+      return;
+    }
+    // The native backend must enter manual mode BEFORE applying the stored
+    // size; otherwise a queued auto-fit command can immediately shrink it.
+    void invoke("set_palette_user_sized", {
+      enabled: true, width: stored.width, height: stored.height,
+    }).catch((error) => {
+      console.warn("LocalSearch saved window size could not be restored:", error);
+      userSizedRef.current = false;
+      setUserSized(false);
+    }).finally(() => { restoringSizeRef.current = false; });
+  }, []);
+  useEffect(() => {
+    if (import.meta.env.VITE_DEMO) return;
+    let latest: number | null = null;
+    const saveSize = () => {
+      if (!userSizedRef.current || restoringSizeRef.current || showSettingsRef.current) return;
+      if (window.innerWidth < 720 || window.innerHeight < 320) return;
+      if (latest != null) window.clearTimeout(latest);
+      latest = window.setTimeout(() => {
+        if (!userSizedRef.current || restoringSizeRef.current || showSettingsRef.current) return;
+        try {
+          localStorage.setItem("localsearch.window-size.v1", JSON.stringify({
+            width: window.innerWidth, height: window.innerHeight,
+          }));
+        } catch { /* private storage may be unavailable */ }
+      }, 180);
+    };
+    window.addEventListener("resize", saveSize);
+    // Record the final size after the native resize drag finishes. Mouse-up
+    // is not guaranteed to fire on the button, so watch at window level.
+    window.addEventListener("pointerup", saveSize);
+    return () => {
+      window.removeEventListener("resize", saveSize);
+      window.removeEventListener("pointerup", saveSize);
+      if (latest != null) window.clearTimeout(latest);
+    };
+  }, []);
+
+  // Step 28 stable: resize by tracked pointer movements rather than a macOS
+  // native resize gesture started AFTER an asynchronous IPC roundtrip. That
+  // gesture can miss the initiating mouse-down and collapse the layout.
+  const resizeGestureRef = useRef<{
+    startX: number; startY: number; width: number; height: number;
+  } | null>(null);
+  const resizeRequestedRef = useRef<{ width: number; height: number } | null>(null);
+  const lastDraggedSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const resizeRequestBusyRef = useRef(false);
+  const resizeBackendReadyRef = useRef(false);
+  // Track both outstanding IPC stages: Reset must not unlock auto-fit before
+  // the last in-flight manual set_size completes (including a late enable).
+  const resizeEnableRef = useRef<Promise<void> | null>(null);
+  const resizeDrainRef = useRef<Promise<void> | null>(null);
+  const resizeResettingRef = useRef(false);
+  const flushUserResize = useCallback(() => {
+    if (resizeRequestBusyRef.current || !resizeBackendReadyRef.current || resizeResettingRef.current) return;
+    resizeRequestBusyRef.current = true;
+    const drain = (async () => {
+      try {
+        while (resizeRequestedRef.current && !resizeResettingRef.current) {
+          // Coalesce pointer moves without allowing concurrent set_size calls.
+          const size = resizeRequestedRef.current;
+          resizeRequestedRef.current = null;
+          await invoke("set_palette_user_sized", { enabled: true, ...size });
+        }
+      } catch (error) {
+        resizeBackendReadyRef.current = false;
+        resizeGestureRef.current = null;
+        setLastError(`Не удалось изменить размер окна: ${String(error)}`);
+      } finally {
+        resizeRequestBusyRef.current = false;
+      }
+    })();
+    resizeDrainRef.current = drain;
+    void drain.finally(() => {
+      if (resizeDrainRef.current === drain) resizeDrainRef.current = null;
+    });
+  }, []);
+  const beginUserResize = useCallback((screenX: number, screenY: number) => {
+    if (resizeResettingRef.current) return;
+    resizeGestureRef.current = {
+      startX: screenX, startY: screenY,
+      width: window.innerWidth, height: window.innerHeight,
+    };
+    resizeRequestedRef.current = null;
+    lastDraggedSizeRef.current = null;
+    resizeBackendReadyRef.current = false;
+    userSizedRef.current = true;
+    restoringSizeRef.current = false;
+    setUserSized(true);
+    const enabling = invoke<void>("enable_palette_user_resize")
+      .then(() => {
+        if (resizeResettingRef.current) return;
+        resizeBackendReadyRef.current = true;
+        flushUserResize();
+      })
+      .catch((error) => {
+        if (resizeResettingRef.current) return;
+        resizeGestureRef.current = null;
+        userSizedRef.current = false;
+        setUserSized(false);
+        setLastError(`Не удалось включить изменение размера: ${String(error)}`);
+      });
+    resizeEnableRef.current = enabling;
+    void enabling.finally(() => {
+      if (resizeEnableRef.current === enabling) resizeEnableRef.current = null;
+    });
+  }, [flushUserResize]);
+  const moveUserResize = useCallback((screenX: number, screenY: number) => {
+    const g = resizeGestureRef.current;
+    if (!g) return;
+    // Bound the drag by the usable screen, keeping the footer/reset control
+    // reachable instead of creating an off-screen window with no escape.
+    const maxWidth = Math.max(720, Math.min(2600, window.screen.availWidth - 24));
+    const maxHeight = Math.max(320, Math.min(1700, window.screen.availHeight - 24));
+    resizeRequestedRef.current = {
+      width: Math.min(maxWidth, Math.max(720, Math.round(g.width + screenX - g.startX))),
+      height: Math.min(maxHeight, Math.max(320, Math.round(g.height + screenY - g.startY))),
+    };
+    lastDraggedSizeRef.current = resizeRequestedRef.current;
+    flushUserResize();
+  }, [flushUserResize]);
+  const endUserResize = useCallback(() => {
+    resizeGestureRef.current = null;
+    // A fast IPC may already have emptied the pending slot before pointerup.
+    // Persist the last requested dimensions regardless of queue timing.
+    const finalSize = lastDraggedSizeRef.current;
+    if (finalSize && !resizeResettingRef.current) {
+      try { localStorage.setItem("localsearch.window-size.v1", JSON.stringify(finalSize)); }
+      catch { /* optional persistence */ }
+    }
+    flushUserResize();
+  }, [flushUserResize]);
+  const expandUserResize = useCallback(() => {
+    const dims = {
+      width: Math.max(720, Math.min(1180, window.screen.availWidth - 50)),
+      height: Math.max(320, Math.min(850, window.screen.availHeight - 70)),
+    };
+    // Atomic backend lock + set_size, independent of mouse gesture support.
+    void invoke("set_palette_user_sized", { enabled: true, ...dims })
+      .then(() => {
+        userSizedRef.current = true;
+        restoringSizeRef.current = false;
+        setUserSized(true);
+        try { localStorage.setItem("localsearch.window-size.v1", JSON.stringify(dims)); }
+        catch { /* optional persistence */ }
+      })
+      .catch(error => setLastError(`Не удалось развернуть выдачу: ${String(error)}`));
+  }, []);
+  const resetUserResize = useCallback(() => {
+    if (resizeResettingRef.current) return;
+    resizeResettingRef.current = true;
+    resizeGestureRef.current = null;
+    resizeRequestedRef.current = null;
+    resizeBackendReadyRef.current = false;
+    // Await the final pointer IPC before releasing the Rust-side auto-fit lock.
+    void (async () => {
+      await resizeEnableRef.current;
+      await resizeDrainRef.current;
+      await invoke("set_palette_user_sized", {
+        enabled: false, width: null, height: null,
+      });
+      userSizedRef.current = false;
+      restoringSizeRef.current = false;
+      try { localStorage.removeItem("localsearch.window-size.v1"); } catch { /* optional */ }
+      setUserSized(false); // layout effect now measures the compact content
+    })().catch((error) => {
+      setLastError(`Не удалось сбросить размер окна: ${String(error)}`);
+    }).finally(() => { resizeResettingRef.current = false; });
+  }, []);
+
+  // The window follows `previewShown` at once, but a resize lands a frame or
+  // more later (on macOS asynchronously). Laying the pane out before that
+  // squeezed it into the old narrow window, and it then jumped right as the
+  // window grew (#11). So while the window has yet to catch up the panel keeps
+  // the wide width and the window edge clips it: opening, the pane waits off
+  // screen and the widening window uncovers it; closing, the shrinking window
+  // covers it before the layout drops it.
+  const [windowWide, setWindowWide] = useState(false);
+  useEffect(() => {
+    if (import.meta.env.VITE_DEMO) {
+      // no real window in the demo: the page is as wide as the browser
+      setWindowWide(previewShown);
+      return;
+    }
+    let settle = 0;
+    const done = () => {
+      window.removeEventListener("resize", measure);
+      clearTimeout(settle);
+    };
+    function measure() {
+      const wide = window.innerWidth > (WINDOW_WIDTH + WINDOW_WIDTH_PREVIEW) / 2;
+      setWindowWide(wide);
+      if (wide === previewShown) done();
+    }
+    window.addEventListener("resize", measure);
+    // a window that never reaches the size (the page and the window
+    // disagreeing on the scale) must not strand the pane off screen
+    settle = window.setTimeout(() => {
+      done();
+      setWindowWide(previewShown);
+    }, 400);
+    measure();
+    return done;
+  }, [previewShown]);
+  const paneLaidOut = userSized ? previewShown : previewShown || windowWide;
+  const paneCatchingUp = !userSized && paneLaidOut && previewShown !== windowWide;
+
+  // the panel's outline follows the window's (#16): on Windows the frosted
+  // backdrop fills the window, so a CSS radius wider than the window's own
+  // corners showed a square of glass around them
+  const windowCorners = status?.window_corners ?? null;
+  useEffect(() => {
+    const radius = windowCorners === "round" ? "8px" : windowCorners === "square" ? "0px" : null;
+    if (radius) document.documentElement.style.setProperty("--radius", radius);
+    else document.documentElement.style.removeProperty("--radius");
+  }, [windowCorners]);
+
+  // window size follows content; the preview pane widens the palette
+  const previewShownRef = useRef(previewShown);
+  previewShownRef.current = previewShown;
+  const misfitNoted = useRef(false);
+  const fitWindow = useCallback((recheck: boolean) => {
+    const el = panelRef.current;
+    if (!el || userSizedRef.current || showSettingsRef.current || settingsManualRef.current) return;
+    const h = Math.min(Math.max(el.offsetHeight, 96), 620);
+    const w = previewShownRef.current ? WINDOW_WIDTH_PREVIEW : WINDOW_WIDTH;
+    // through the backend, not setSize: the backend skips no-op resizes and
+    // clamps the window back onto the screen when the reserved room (see
+    // show_window) is not there, e.g. after a drag against the screen edge.
+    // The page's own pixel ratio goes along: the window gets css × dpr
+    // physical pixels, whatever scale factor the window believes it has (#16)
+    invoke("resize_palette", { width: w, height: h, dpr: window.devicePixelRatio })
+      .then(() => {
+        if (!recheck) return;
+        // a moment later the page must see all of the palette. The webview
+        // can trail the window by a frame or two while typing, so a short
+        // palette is sized once more and checked again; only a palette still
+        // cut off after that goes in the log, with the numbers to tell why
+        const cutOff = () => {
+          const p = panelRef.current;
+          if (!p || p.offsetHeight > 620) return null;
+          const bottom = p.getBoundingClientRect().bottom;
+          return bottom > window.innerHeight + 1 ? bottom : null;
+        };
+        setTimeout(() => {
+          if (cutOff() == null) return;
+          fitWindow(false);
+          setTimeout(() => {
+            const bottom = cutOff();
+            if (bottom == null || misfitNoted.current) return;
+            misfitNoted.current = true;
+            invoke("note_palette_misfit", { panel: bottom, viewport: window.innerHeight, dpr: window.devicePixelRatio }).catch(() => {});
+          }, 400);
+        }, 120);
+      })
+      .catch(() => {});
+  }, []);
+  // Test-only: the original 720px search palette must not auto-shrink an open
+  // settings window. Native resizing remains enabled; store settings geometry
+  // separately from the user's compact search layout.
+  const settingsManualRef = useRef(false);
+  useEffect(() => {
+    if (import.meta.env.VITE_DEMO) return;
+    if (showSettings) {
+      settingsManualRef.current = true;
+      let stored: {width?: number; height?: number} | null = null;
+      try { stored = JSON.parse(localStorage.getItem('localsearch.test.settings.size.v1') || 'null'); }
+      catch { /* first launch */ }
+      const maxW = Math.max(720, window.screen.availWidth - 32);
+      const maxH = Math.max(380, window.screen.availHeight - 52);
+      const width = Math.min(maxW, Math.max(720, stored?.width ?? Math.max(window.innerWidth, 960)));
+      const height = Math.min(maxH, Math.max(380, stored?.height ?? Math.max(window.innerHeight, 690)));
+      void invoke('set_palette_user_sized', { enabled: true, width, height })
+        .catch(error => setLastError(`Не удалось настроить размер окна: ${String(error)}`));
+      return;
+    }
+    if (settingsManualRef.current) {
+      settingsManualRef.current = false;
+      if (!userSizedRef.current) {
+        void invoke('set_palette_user_sized', { enabled: false, width: null, height: null })
+          .then(() => fitWindow(false))
+          .catch(error => setLastError(`Не удалось вернуть размер поиска: ${String(error)}`));
+      } else {
+        // Restore the user's chosen search geometry after leaving settings.
+        let saved: {width: number; height: number} | null = null;
+        try { saved = JSON.parse(localStorage.getItem('localsearch.window-size.v1') || 'null'); }
+        catch { /* ignore */ }
+        if (saved && Number.isFinite(saved.width) && Number.isFinite(saved.height)) {
+          void invoke('set_palette_user_sized', { enabled: true, width: saved.width, height: saved.height })
+            .catch(error => setLastError(String(error)));
+        }
+      }
+    }
+  }, [showSettings, fitWindow]);
+  useEffect(() => {
+    if (!showSettings || import.meta.env.VITE_DEMO) return;
+    let job: number | null = null;
+    const remember = () => {
+      if (job != null) window.clearTimeout(job);
+      job = window.setTimeout(() => {
+        const width = window.innerWidth, height = window.innerHeight;
+        if (width >= 720 && height >= 320) {
+          try { localStorage.setItem('localsearch.test.settings.size.v1', JSON.stringify({width, height})); }
+          catch { /* optional persistence */ }
+        }
+      }, 280);
+    };
+    window.addEventListener('resize', remember);
+    return () => {
+      window.removeEventListener('resize', remember);
+      if (job != null) window.clearTimeout(job);
+    };
+  }, [showSettings]);
+
+  useLayoutEffect(() => {
+    fitWindow(true);
+  });
+  // and whenever the panel changes size without a render (late layout). The
+  // panel element can come and go (the welcome screen first), so each render
+  // checks that the one on screen is the one observed
+  const panelObserver = useRef<{ el: HTMLElement; ro: ResizeObserver } | null>(null);
+  useEffect(() => {
+    const el = panelRef.current;
+    if (panelObserver.current?.el === el) return;
+    panelObserver.current?.ro.disconnect();
+    panelObserver.current = null;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => fitWindow(true));
+    ro.observe(el);
+    panelObserver.current = { el, ro };
+  });
+  useEffect(() => () => panelObserver.current?.ro.disconnect(), []);
+
+  // fetch preview content for the selected hit; the hit itself already
+  // carries everything for clips/web/apps. A local file waits until the
+  // selection rests (#13): arrowing down a list should not decode every
+  // image and PDF on the way. Stars come from the index and show at once,
+  // and so does whatever is selected when the pane is opened.
+  const previewWasOpen = useRef(false);
+  // what the pane shows depends on which row is selected (and on the query,
+  // which picks the excerpt), not on the list around it: a refresh that
+  // keeps the row selected keeps its preview. A file's mtime is part of it,
+  // so a file that changed on disk is fetched again.
+  const selHit = results[selected] as Hit | undefined;
+  const previewKey = selHit
+    ? `${hitKey(selHit)}@${"mtime" in selHit ? selHit.mtime : ""}|${query}`
+    : "";
+  const [preview, setPreview] = useKeyedState<Record<string, unknown>>(previewKey);
+  useEffect(() => {
+    const justOpened = previewOpen && !previewWasOpen.current;
+    previewWasOpen.current = previewOpen;
+    if (!previewOpen) return;
+    const hit = results[selected];
+    if (!hit) return;
+    const needsFetch =
+      hit.kind === "file" ||
+      hit.kind === "video" ||
+      hit.kind === "repo" ||
+      (hit.kind === "clip" && hit.clip_kind === "image");
+    if (!needsFetch) {
+      return;
+    }
+    // what arrives belongs to this key; a slower fetch for an earlier
+    // selection is dropped here and could not be read under the new key
+    const key = previewKey;
+    let stale = false;
+    const delay =
+      justOpened || hit.kind === "repo"
+        ? 0
+        : hit.kind === "file" || hit.kind === "video"
+          ? LOCAL_PREVIEW_DELAY_MS
+          : 100;
+    const t = setTimeout(() => {
+      invoke<Record<string, unknown>>("get_preview", {
+        kind: hit.kind,
+        id: hit.id,
+        query: queryRef.current,
+      })
+        .then((p) => {
+          if (!stale) setPreview(key, p);
+        })
+        .catch(() => {
+          // "none", not null: null means still loading, and a failed
+          // fetch should fall back to the file details, not spin forever
+          if (!stale) setPreview(key, { kind: "none" });
+        });
+    }, delay);
+    return () => {
+      stale = true;
+      clearTimeout(t);
+    };
+  }, [previewOpen, previewKey]);
+
+  // where the previewed file was downloaded from, if a browser recorded it
+  // (origin.rs): a metadata read, no wait needed
+  const originPath =
+    previewOpen && selHit && (selHit.kind === "file" || selHit.kind === "video") ? selHit.path : null;
+  const [origin, setOrigin] = useKeyedState<FileOrigin | null>(originPath);
+  useEffect(() => {
+    if (!originPath) return;
+    let stale = false;
+    invoke<FileOrigin | null>("file_origin", { path: originPath })
+      .then((o) => {
+        if (!stale) setOrigin(originPath, o);
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  }, [originPath]);
+
+  // a bookmark or history row: what the index knows about its address
+  // (webinfo.rs), so a page you forgot is described without opening it
+  const webUrl =
+    previewOpen && selHit && (selHit.kind === "bookmark" || selHit.kind === "history") ? selHit.url : null;
+  const [webInfo, setWebInfo] = useKeyedState<WebInfo>(webUrl);
+  useEffect(() => {
+    if (!webUrl) return;
+    let stale = false;
+    invoke<WebInfo>("web_details", { url: webUrl })
+      .then((w) => {
+        if (!stale) setWebInfo(webUrl, w);
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  }, [webUrl]);
+
+  // keep selection visible
+  useEffect(() => {
+    listRef.current
+      ?.querySelector<HTMLElement>(`[data-idx="${selected}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [selected, results]);
+
+  // Every action that "uses" the query (open, copy, paste, note) ends here:
+  // the palette goes away and the query with it, so the next summon starts
+  // from an empty box instead of the last thing that was opened. Hide first
+  // so the empty state never flashes on screen. Escape deliberately keeps
+  // the query: dismissing is not finishing.
+  const finishAction = useCallback(async () => {
+    await hidePalette();
+    setQuery("");
+    setImageQuery(null);
+  }, []);
+
+  /// Enter (or a click) on the calculator / transform row: copy the image
+  /// (a QR code) or the value (a color's hex); an error copies nothing.
+  const takeCalc = useCallback(
+    async (c: CalcHit) => {
+      if (c.error || isInfoRow(c)) return;
+      try {
+        if (c.action) {
+          // typed on before this row caught up (vol 4 → vol 40): not yet
+          if (c.forQuery !== undefined && c.forQuery !== queryRef.current.trim()) return;
+          // a typed path opens (the backend hides the palette); the volume
+          // changes and the footer says to what
+          await invoke<string>("run_action", { action: c.action });
+          const [kind, arg] = [c.action.split(":")[0], c.action.slice(c.action.indexOf(":") + 1)];
+          if (kind === "volume") setNotice(tf("Volume set to {n}%", { n: arg }));
+          else if (kind === "mute") setNotice(arg === "true" ? t("Sound muted") : t("Sound on"));
+          await finishAction();
+          return;
+        }
+        if (c.timer) {
+          // a countdown: the app keeps the clock, a notification says when
+          await invoke("start_timer", { seconds: c.timer, label: c.value });
+          setNotice(tf("Timer set: {clock}", { clock: clock(c.timer) }));
+          await finishAction();
+          return;
+        }
+        if (c.timerIds) {
+          for (const id of c.timerIds) await invoke("cancel_timer", { id });
+          setCalcHit(null);
+          setNotice(tf("Stopped {n} timers", { n: c.timerIds.length }));
+          return;
+        }
+        if (c.image) {
+          await invoke("copy_png", { pngB64: c.image });
+        } else {
+          await invoke("copy_clip", { text: c.swatch ?? c.value });
+        }
+        await finishAction();
+      } catch (e) {
+        setLastError(String(e));
+      }
+    },
+    [finishAction],
+  );
+
+  // the selected row's identity: a list that only grows (file results
+  // arriving after the apps) keeps it, so nothing in progress is dropped
+  const selectedKey = results[selected] ? hitKey(results[selected]) : null;
+  // a pending confirmation lapses when the selection moves to another row,
+  // or after a few seconds
+  useEffect(() => {
+    setArmed(null);
+  }, [selectedKey]);
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(null), 4000);
+    return () => clearTimeout(t);
+  }, [armed]);
+
+  /// Run a system command or end a process. Ending a process, and the
+  /// commands that lose something (restart, shut down, empty the trash),
+  /// take a second Enter: the first one only arms the row.
+  const runRisky = useCallback(
+    async (hit: CommandHit | ProcessHit): Promise<boolean> => {
+      const key = hitKey(hit);
+      const needsConfirm = hit.kind === "process" || hit.destructive;
+      if (needsConfirm && armedRef.current !== key) {
+        setArmed(key);
+        return false;
+      }
+      setArmed(null);
+      try {
+        if (hit.kind === "command") {
+          await invoke("run_system_command", { id: hit.id, confirmed: true });
+          await finishAction();
+        } else {
+          await invoke("end_process", { pid: hit.pid, name: hit.name });
+          setLastError(null);
+          // the list without it; the palette stays for the next one
+          void refreshResults();
+        }
+      } catch (e) {
+        setLastError(String(e));
+      }
+      return true;
+    },
+    [finishAction, refreshResults],
+  );
+
+  /// Enter on a script command. Missing arguments: the box gets its keyword
+  /// to type them after. Otherwise it runs (twice Enter when it asks for
+  /// confirmation) and shows what it printed as its mode says.
+  const runScriptHit = useCallback(
+    async (hit: ScriptHit) => {
+      const missing = hit.args.some((a, i) => !a.optional && !(hit.given[i] ?? "").trim());
+      if (missing) {
+        setQuery(`${hit.keyword ?? hit.title} `);
+        setNotice(
+          tf("Type {what} after the name, then Enter", {
+            what: hit.args.map((a) => a.placeholder || "…").join(", "),
+          }),
+        );
+        inputRef.current?.focus();
+        return;
+      }
+      if (!hit.runner) {
+        setLastError(t("Nothing on this computer runs this script"));
+        return;
+      }
+      const key = hitKey(hit);
+      if (hit.confirm && armedRef.current !== key) {
+        setArmed(key);
+        return;
+      }
+      setArmed(null);
+      if (hit.mode === "silent") {
+        await finishAction();
+      } else {
+        setNotice(tf("Running {title}…", { title: hit.title }));
+      }
+      const lastLine = (s: string) => s.trim().split("\n").filter((l) => l.trim()).pop() ?? "";
+      try {
+        const out = await invoke<ScriptOutput>("run_script", { path: hit.path, given: hit.given });
+        setNotice(null);
+        if (!out.ok && hit.mode !== "fullOutput") {
+          const why = out.timed_out
+            ? t("Stopped after a minute")
+            : tf("Exited with code {code}", { code: String(out.code ?? "?") });
+          const said = lastLine(out.stderr) || lastLine(out.stdout);
+          setLastError(`${hit.title}: ${why}${said ? ` · ${said}` : ""}`);
+        } else if (hit.mode === "compact") {
+          setNotice(lastLine(out.stdout) || t("Done"));
+        } else if (hit.mode === "fullOutput") {
+          setScriptOut({ title: hit.title, out });
+          setResults([]);
+        }
+      } catch (e) {
+        setNotice(null);
+        setLastError(String(e));
+      }
+    },
+    [finishAction],
+  );
+
+  const openHit = useCallback(async (hit: Hit | undefined) => {
+    if (!hit) return;
+    if (hit.kind === "script") {
+      await runScriptHit(hit);
+      return;
+    }
+    if (hit.kind === "folder") {
+      try {
+        const said = await invoke<string>("open_pinned_folder", { path: hit.path });
+        if (said.startsWith("dry run:")) setNotice(said);
+        else await finishAction();
+      } catch (e) {
+        setLastError(String(e));
+      }
+      return;
+    }
+    if (hit.kind === "command" || hit.kind === "process") {
+      await runRisky(hit);
+      return;
+    }
+    if (hit.kind === "workspace") {
+      // everything in it opens; what could not is named, and the palette
+      // stays so the user sees it
+      try {
+        const report = await invoke<string[]>("open_workspace", { name: hit.name });
+        if (report.length === 0) {
+          await finishAction();
+        } else if (report.every((r) => r.startsWith("dry run:"))) {
+          setNotice(report.join("\n"));
+        } else {
+          setLastError(tf("Some could not open: {list}", { list: report.join("; ") }));
+        }
+      } catch (e) {
+        setLastError(String(e));
+      }
+      return;
+    }
+    // frecency: remember what actually gets opened (stable identity per kind)
+    const frecencyKey =
+      hit.kind === "app"
+        ? hit.target
+        : hit.kind === "file" || hit.kind === "video"
+          ? hit.path
+          : hit.kind === "bookmark" || hit.kind === "history"
+            ? hit.url
+            : hit.kind === "repo"
+              ? String(hit.id)
+              : null;
+    if (frecencyKey) {
+      invoke("record_hit_use", { kind: hit.kind, key: frecencyKey }).catch(() => {});
+    }
+    try {
+      if (hit.kind === "repo") {
+        await invoke("open_repo", { url: hit.html_url });
+      } else if (hit.kind === "bookmark" || hit.kind === "history") {
+        await invoke("open_repo", { url: hit.url });
+      } else if (hit.kind === "app") {
+        await invoke("launch_app", { target: hit.target });
+      } else if (hit.kind === "clip") {
+        if (hit.clip_kind === "image") {
+          await invoke("copy_image_clip", { clipId: hit.id });
+        } else {
+          await invoke("copy_clip", { text: hit.content });
+        }
+      } else if (hit.kind === "video") {
+        // default player with a seek interface starts at the matched shot
+        await invoke("play_video", { path: hit.path, tsMs: hit.start_ms });
+      } else {
+        await invoke("open_file", { path: hit.path });
+      }
+      await finishAction();
+    } catch (e) {
+      const msg = String(e);
+      if (hit.kind === "app" && msg.includes("moved or been removed")) {
+        // the backend is rescanning apps; search again once it has, so the
+        // stale row goes away
+        setLastError(t("That app has moved or been removed; the app list was refreshed."));
+        setTimeout(() => void refreshResults(), 1200);
+      } else {
+        setLastError(msg);
+      }
+    }
+  }, [finishAction, refreshResults, runRisky, runScriptHit]);
+
+  /// What the action menu (Ctrl/Cmd+K) offers for a row. The first entry is
+  /// what Enter does on the row itself.
+  const rowActions = useCallback(
+    (hit: Hit): RowAction[] => {
+      const act = (p: Promise<unknown>) => p.catch((e) => setLastError(String(e)));
+      const copy = (text: string) => act(invoke("copy_clip", { text }));
+      const refresh = () => void refreshResults();
+      // a file's folder in a terminal, the file in each installed editor
+      const openElsewhere = (path: string): RowAction[] => [
+        {
+          key: "terminal",
+          label: t("Open in terminal"),
+          run: () => act(invoke("open_in_terminal", { path }).then(finishAction)),
+        },
+        ...editors.map((ed) => ({
+          key: `editor-${ed.name}`,
+          label: tf("Open in {app}", { app: ed.name }),
+          run: () => act(invoke("open_in_editor", { path, editor: ed.target }).then(finishAction)),
+        })),
+      ];
+      // Ctrl+E / ⌘E (#14): the app picked for the type, named when there is one
+      const editAction = (path: string): RowAction => {
+        const app = editAppName(path);
+        return {
+          key: "edit",
+          label: app ? tf("Edit with {app}", { app }) : t("Edit"),
+          shortcut: EDIT_SHORTCUT,
+          run: () => editFile(path),
+        };
+      };
+      // the recall card: never this one again; the list gets today's next
+      const recallSkip = (h: RepoHit | BookmarkHit, key: string): RowAction[] =>
+        h.recall
+          ? [
+              {
+                key: "recall-skip",
+                label: t("Don't show this again"),
+                run: () => act(invoke("recall_skip", { kind: h.kind, key }).then(refresh)),
+              },
+            ]
+          : [];
+      // to the OS trash, on a second Enter; the row leaves the list
+      const trashAction = (h: FileHit | VideoHit): RowAction => ({
+        key: "trash",
+        label: t(IS_WIN ? "Move to Recycle Bin" : "Move to Trash"),
+        risky: true,
+        run: async () => {
+          const k = hitKey(h);
+          if (armedRef.current !== k) {
+            setArmed(k);
+            return;
+          }
+          setArmed(null);
+          try {
+            await invoke("trash_path", { path: h.path, confirmed: true });
+            setResults((rs) => rs.filter((x) => hitKey(x) !== k));
+            const name = h.path.split(/[\\/]/).pop() ?? h.path;
+            setNotice(tf(IS_WIN ? "Moved {name} to the Recycle Bin" : "Moved {name} to the Trash", { name }));
+          } catch (e) {
+            setLastError(String(e));
+          }
+        },
+      });
+      switch (hit.kind) {
+        case "file":
+          return [
+            { key: "reveal", label: t("Show in folder"), run: () => openHit(hit) },
+            {
+              key: "open",
+              label: t("Open with default app"),
+              run: () => act(invoke("open_path_default", { path: hit.path }).then(finishAction)),
+            },
+            editAction(hit.path),
+            ...(/\.pdf$/i.test(hit.path)
+              ? [
+                  {
+                    key: "pdf-md-copy",
+                    label: t("Copy as Markdown"),
+                    run: async () => {
+                      setNotice(t("Converting the PDF…"));
+                      try {
+                        const md = await invoke<string>("pdf_markdown", { path: hit.path });
+                        await invoke("copy_clip", { text: md });
+                        setNotice(tf("Copied {n} characters of Markdown", { n: md.length }));
+                      } catch (e) {
+                        setNotice(null);
+                        setLastError(String(e));
+                      }
+                    },
+                  },
+                  {
+                    key: "pdf-md-save",
+                    label: t("Save as Markdown…"),
+                    run: async () => {
+                      const dest = await holdOpen(() =>
+                        saveDialog({
+                          defaultPath: hit.path.replace(/\.pdf$/i, ".md"),
+                          filters: [{ name: "Markdown", extensions: ["md"] }],
+                        }),
+                      );
+                      if (!dest) return;
+                      setNotice(t("Converting the PDF…"));
+                      try {
+                        await invoke("save_pdf_markdown", { path: hit.path, dest });
+                        setNotice(tf("Saved {name}", { name: dest.split(/[\\/]/).pop() ?? dest }));
+                      } catch (e) {
+                        setNotice(null);
+                        setLastError(String(e));
+                      }
+                    },
+                  },
+                ]
+              : []),
+            { key: "copy-path", label: t("Copy path"), run: () => copy(hit.path) },
+            { key: "copy-file", label: t("Copy file"), run: () => act(invoke("copy_file_clip", { path: hit.path })) },
+            ...openElsewhere(hit.path),
+            trashAction(hit),
+          ];
+        case "video":
+          return [
+            { key: "play", label: t("Play"), run: () => openHit(hit) },
+            {
+              key: "reveal",
+              label: t("Show in folder"),
+              run: () => act(invoke("open_file", { path: hit.path }).then(finishAction)),
+            },
+            editAction(hit.path),
+            { key: "copy-path", label: t("Copy path"), run: () => copy(hit.path) },
+            ...openElsewhere(hit.path),
+            trashAction(hit),
+          ];
+        case "app": {
+          // a Store app (apps.rs STORE_APP_PREFIX) is no file: no folder to
+          // show, no elevation, and its target is no path to copy
+          const store = isStoreApp(hit.target);
+          return [
+            { key: "open", label: t("Open"), run: () => openHit(hit) },
+            ...(store
+              ? []
+              : [
+                  {
+                    key: "reveal",
+                    label: t("Show in folder"),
+                    run: () => act(invoke("reveal_app", { target: hit.target }).then(finishAction)),
+                  },
+                ]),
+            ...(IS_WIN && !store
+              ? [
+                  {
+                    key: "admin",
+                    label: t("Run as administrator"),
+                    run: () => act(invoke("run_app_as_admin", { target: hit.target }).then(finishAction)),
+                  },
+                ]
+              : []),
+            ...(store ? [] : [{ key: "copy-path", label: t("Copy path"), run: () => copy(hit.target) }]),
+          ];
+        }
+        case "repo":
+          return [
+            { key: "open", label: t("Open in browser"), run: () => openHit(hit) },
+            { key: "copy-url", label: t("Copy URL"), run: () => copy(hit.html_url) },
+            { key: "copy-clone", label: t("Copy clone command"), run: () => copy(`git clone ${hit.html_url}.git`) },
+            ...recallSkip(hit, String(hit.id)),
+          ];
+        case "bookmark":
+        case "history":
+          return [
+            { key: "open", label: t("Open in browser"), run: () => openHit(hit) },
+            { key: "copy-url", label: t("Copy URL"), run: () => copy(hit.url) },
+            {
+              key: "copy-md",
+              label: t("Copy as Markdown link"),
+              run: () => copy(`[${(hit.title || hit.url).replace(/[[\]]/g, "")}](${hit.url})`),
+            },
+            ...(hit.kind === "bookmark" ? recallSkip(hit, hit.url) : []),
+          ];
+        case "clip":
+          return [
+            { key: "copy", label: t("Copy"), run: () => openHit(hit) },
+            ...(hit.clip_kind === "text"
+              ? [
+                  {
+                    key: "paste",
+                    label: t("Paste into the previous app"),
+                    run: () =>
+                      act(
+                        invoke("paste_clip", { text: hit.content }).then(() => {
+                          setQuery("");
+                          setImageQuery(null);
+                        }),
+                      ),
+                  },
+                ]
+              : []),
+            ...(hit.masked != null
+              ? [
+                  {
+                    key: "reveal",
+                    label: revealed.has(hit.id) ? t("Hide the full text") : t("Show the full text"),
+                    run: () => toggleReveal(hit.id),
+                  },
+                ]
+              : []),
+            ...(hit.clip_kind === "image"
+              ? [
+                  {
+                    key: "save-image",
+                    label: t("Save image…"),
+                    run: async () => {
+                      const d = new Date();
+                      const pad = (n: number) => String(n).padStart(2, "0");
+                      const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+                      const dest = await holdOpen(() =>
+                        saveDialog({
+                          defaultPath: `clipboard-${stamp}.jpg`,
+                          filters: [{ name: "JPEG", extensions: ["jpg", "jpeg"] }],
+                        }),
+                      );
+                      if (!dest) return;
+                      try {
+                        await invoke("save_clip_image", { clipId: hit.id, dest });
+                        setNotice(tf("Saved {name}", { name: dest.split(/[\\/]/).pop() ?? dest }));
+                      } catch (e) {
+                        setLastError(String(e));
+                      }
+                    },
+                  },
+                ]
+              : []),
+            {
+              key: "pin",
+              label: hit.pinned ? t("Unpin") : t("Pin"),
+              run: () => act(invoke("toggle_pin_clip", { clipId: hit.id }).then(refresh)),
+            },
+            {
+              key: "delete",
+              label: t("Delete from history"),
+              run: () => act(invoke("delete_clip", { clipId: hit.id }).then(refresh)),
+            },
+          ];
+        case "command":
+          return [{ key: "run", label: t("Run"), risky: hit.destructive, run: () => runRisky(hit) }];
+        case "process":
+          return [
+            { key: "end", label: t("End process"), risky: true, run: () => runRisky(hit) },
+            { key: "copy-pid", label: t("Copy PID"), run: () => copy(String(hit.pid)) },
+            ...(hit.exe ? [{ key: "copy-path", label: t("Copy path"), run: () => copy(hit.exe ?? "") }] : []),
+          ];
+        case "folder":
+          return [
+            { key: "open", label: t("Open"), run: () => openHit(hit) },
+            { key: "copy-path", label: t("Copy path"), run: () => copy(hit.path) },
+            {
+              key: "unpin",
+              label: t("Unpin the folder"),
+              run: () =>
+                act(
+                  invoke<string[]>("get_pinned_folders")
+                    .then((all) => invoke<string[]>("set_pinned_folders", { paths: all.filter((p) => p !== hit.path) }))
+                    .then((left) => {
+                      setPinnedFolders(left);
+                      refresh();
+                    }),
+                ),
+            },
+          ];
+        case "script":
+          return [
+            { key: "run", label: t("Run"), risky: hit.confirm, run: () => openHit(hit) },
+            { key: "copy-path", label: t("Copy path"), run: () => copy(hit.path) },
+            {
+              key: "folder",
+              label: t("Open the scripts folder"),
+              run: () => act(invoke("open_scripts_folder").then(finishAction)),
+            },
+          ];
+        case "workspace": {
+          const changed = () => {
+            void loadWorkspaces();
+            refresh();
+          };
+          return [
+            { key: "open", label: t("Open everything"), run: () => openHit(hit) },
+            ...hit.items.map((it, i) => ({
+              key: `ws-out-${i}`,
+              label: tf("Take “{title}” out", { title: it.title }),
+              run: () => act(invoke("workspace_remove_item", { name: hit.name, kind: it.kind, target: it.target }).then(changed)),
+            })),
+            {
+              key: "ws-delete",
+              label: t("Delete this workspace"),
+              risky: true,
+              run: async () => {
+                const k = hitKey(hit);
+                if (armedRef.current !== k) {
+                  setArmed(k);
+                  return;
+                }
+                setArmed(null);
+                await act(invoke("workspace_delete", { name: hit.name }).then(changed));
+              },
+            },
+          ];
+        }
+      }
+    },
+    [openHit, runRisky, finishAction, refreshResults, editors, revealed, toggleReveal, editAppName, editFile, loadWorkspaces],
+  );
+
+  // the add-to-workspace entries any openable row gets: the three most
+  // recent workspaces by name, then a new one (the box asks for its name)
+  const wsActions = useCallback(
+    (item: WsItem): RowAction[] => [
+      ...workspaces.slice(0, 3).map((w) => ({
+        key: `ws-add-${w.name}`,
+        label: tf("Add to workspace “{name}”", { name: w.name }),
+        run: async () => {
+          try {
+            const saved = await invoke<Workspace>("workspace_add", { name: w.name, item });
+            setNotice(tf("“{name}” now holds {n}", { name: saved.name, n: saved.items.length }));
+            void loadWorkspaces();
+          } catch (e) {
+            setLastError(String(e));
+          }
+        },
+      })),
+      {
+        key: "ws-new",
+        label: t("Add to a new workspace…"),
+        run: () => {
+          setWsNaming(item);
+          setQuery("");
+          inputRef.current?.focus();
+        },
+      },
+    ],
+    [workspaces, loadWorkspaces],
+  );
+
+  const menuActions = useMemo(() => {
+    if (!actionsOpen || !results[selected]) return [];
+    const hit = results[selected];
+    const item = wsItemOf(hit);
+    return item ? [...rowActions(hit), ...wsActions(item)] : rowActions(hit);
+  }, [actionsOpen, results, selected, rowActions, wsActions]);
+
+  // Enter while the box asks for a new workspace's name: make it with the
+  // waiting item in it (an existing name just takes the item)
+  const saveWsName = useCallback(async () => {
+    const item = wsNaming;
+    const name = queryRef.current.trim();
+    if (!item || !name) return;
+    try {
+      const saved = await invoke<Workspace>("workspace_add", { name, item });
+      setWsNaming(null);
+      setQuery("");
+      setNotice(tf("“{name}” now holds {n}", { name: saved.name, n: saved.items.length }));
+      void loadWorkspaces();
+    } catch (e) {
+      setLastError(String(e));
+    }
+  }, [wsNaming, loadWorkspaces]);
+
+  // the menu belongs to one row: it closes when the selection moves to another
+  useEffect(() => {
+    setActionsOpen(false);
+  }, [selectedKey]);
+
+  /// Run the menu's highlighted action. A risky one arms on the first
+  /// Enter (the menu stays, showing the confirmation) and runs on the second.
+  const runMenuAction = useCallback(
+    async (i: number) => {
+      const a = menuActions[i];
+      if (!a) return;
+      const hit = results[selected];
+      if (a.risky && hit && armedRef.current !== hitKey(hit)) {
+        await a.run(); // arms
+        return;
+      }
+      setActionsOpen(false);
+      await a.run();
+      inputRef.current?.focus();
+    },
+    [menuActions, results, selected],
+  );
+
+  // `note …` → one line into the notes file, then the palette goes away
+  const saveNote = useCallback(async () => {
+    const n = noteHit;
+    if (!n) return;
+    try {
+      await invoke("append_note", { text: n.text });
+      await finishAction();
+    } catch (e) {
+      setLastError(String(e));
+    }
+  }, [noteHit, finishAction]);
+
+  // Ctrl/Cmd+Enter hands the raw query to the default browser: a URL-looking
+  // input opens directly, anything else becomes a web search
+  const openWeb = useCallback(async () => {
+    const q = queryRef.current.trim();
+    if (!q) return;
+    const hasProto = /^https?:\/\//i.test(q);
+    const urlish = /^[\w-]+(\.[\w-]+)+(:\d+)?(\/\S*)?$/i.test(q);
+    const url = hasProto
+      ? q
+      : urlish
+        ? `https://${q}`
+        : `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+    try {
+      await invoke("open_repo", { url });
+      await finishAction();
+    } catch (e) {
+      setLastError(String(e));
+    }
+  }, [finishAction]);
+
+  const switchSource = useCallback((idx: number) => {
+    setSourceIdx(idx);
+    setSelected(0);
+    setSelAnchor(null);
+    setShowSettings(false);
+    inputRef.current?.focus();
+  }, []);
+
+  // Ctrl/Cmd (or Alt) + 1–9 jumps straight to a tab, in the order the strip
+  // shows. On the window so it works whether focus is in the query box, on
+  // <body>, or in settings; other text fields (the shortcut recorders, the
+  // alias box) keep the keys to themselves.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = document.activeElement;
+      const free = el === document.body || el === inputRef.current || el == null;
+      if (!free) return;
+      const i = tabFromKey(e, tabKeysRef.current);
+      if (i == null || i >= sourcesRef.current.length) return;
+      e.preventDefault();
+      switchSource(i);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [switchSource]);
+
+  // move a tab one slot left/right; keeps the active tab selected by id
+  const moveTab = useCallback(
+    (id: string, dir: -1 | 1) => {
+      setSourceOrder((prev) => {
+        const order: string[] = orderedSources(prev).map((s) => s.id);
+        const i = order.indexOf(id);
+        const j = i + dir;
+        if (i < 0 || j < 0 || j >= order.length) return prev;
+        [order[i], order[j]] = [order[j], order[i]];
+        localStorage.setItem("magpie.taborder", JSON.stringify(order));
+        // keep the currently active source visually selected after a reorder
+        const activeId = (sourcesRef.current[sourceIdx] ?? sourcesRef.current[0]).id;
+        const nextIdx = order.indexOf(activeId);
+        if (nextIdx >= 0) setSourceIdx(nextIdx);
+        return order;
+      });
+    },
+    [sourceIdx],
+  );
+
+  const chooseDefaultTab = useCallback((id: string) => {
+    setDefaultTab(id);
+    localStorage.setItem("magpie.defaulttab", id);
+  }, []);
+
+  // show/hide a source tab; the last visible one can't be hidden
+  const toggleTabVisible = useCallback(
+    (id: string) => {
+      setHiddenTabs((prev) => {
+        const hiding = !prev.includes(id);
+        const allIds = orderedSources(loadTabOrder()).map((s) => s.id);
+        const visibleNow = allIds.filter((x) => !prev.includes(x));
+        if (hiding && visibleNow.length <= 1) return prev; // keep at least one
+        const next = hiding ? [...prev, id] : prev.filter((x) => x !== id);
+        localStorage.setItem("magpie.tabhidden", JSON.stringify(next));
+        // if the active tab just vanished, land on the first visible one
+        const nextVisible = allIds.filter((x) => !next.includes(x));
+        const activeId = (sourcesRef.current[sourceIdx] ?? sourcesRef.current[0]).id;
+        const idx = nextVisible.indexOf(activeId);
+        setSourceIdx(idx >= 0 ? idx : 0);
+        return next;
+      });
+    },
+    [sourceIdx],
+  );
+
+  // drag-to-reorder tabs via pointer events. HTML5 drag&drop is NOT usable
+  // here: Tauri's file drag-drop handling (needed for image drops) swallows
+  // the webview's native DnD drop events on Windows.
+  const [dragTab, setDragTab] = useState<string | null>(null);
+
+  const commitDrag = useCallback(
+    (fromId: string, toId: string) => {
+      if (fromId === toId) return;
+      setSourceOrder((prev) => {
+        const order: string[] = orderedSources(prev).map((s) => s.id);
+        const from = order.indexOf(fromId);
+        const to = order.indexOf(toId);
+        if (from < 0 || to < 0) return prev;
+        order.splice(to, 0, order.splice(from, 1)[0]);
+        localStorage.setItem("magpie.taborder", JSON.stringify(order));
+        const activeId = (sourcesRef.current[sourceIdx] ?? sourcesRef.current[0]).id;
+        const nextIdx = order.indexOf(activeId);
+        if (nextIdx >= 0) setSourceIdx(nextIdx);
+        return order;
+      });
+    },
+    [sourceIdx],
+  );
+
+  // a drag ends on any pointer release, wherever it happens
+  useEffect(() => {
+    if (!dragTab) return;
+    const end = () => setDragTab(null);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+    return () => {
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+    };
+  }, [dragTab]);
+
+  const selLo = selAnchor == null ? selected : Math.min(selAnchor, selected);
+  const selHi = selAnchor == null ? selected : Math.max(selAnchor, selected);
+
+  const deleteSelectedClips = useCallback(async () => {
+    const range = results.slice(selLo, selHi + 1).filter((r) => r.kind === "clip");
+    if (range.length === 0) return;
+    try {
+      for (const r of range) {
+        await invoke("delete_clip", { clipId: r.id });
+      }
+      setResults((rs) => rs.filter((_, i) => i < selLo || i > selHi));
+      setSelected(Math.max(0, Math.min(selLo, results.length - range.length - 1)));
+      setSelAnchor(null);
+      refreshStatus();
+    } catch (e) {
+      setLastError(String(e));
+    }
+  }, [results, selLo, selHi, refreshStatus]);
+
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      // Ctrl/Cmd+E (#14): edit the selected file in the app picked for its
+      // type (Settings › Local Files), else the system's own edit action
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.code === "KeyE" || e.key.toLowerCase() === "e")) {
+        const r = results[selected];
+        if (!showSettings && !actionsOpen && r && (r.kind === "file" || r.kind === "video") && !(topRowActive && (calcHit || bangHit))) {
+          e.preventDefault();
+          void editFile(r.path);
+          return;
+        }
+      }
+      // Ctrl/Cmd+K: the selected row's action menu (physical key, so any
+      // layout works)
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.code === "KeyK" || e.key.toLowerCase() === "k")) {
+        e.preventDefault();
+        if (actionsOpen) {
+          setActionsOpen(false);
+        } else if (!showSettings && results[selected] && !(topRowActive && (calcHit || bangHit))) {
+          setActionSel(0);
+          setActionsOpen(true);
+        }
+        return;
+      }
+      if (actionsOpen) {
+        // the menu has the keyboard until it closes
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          const n = menuActions.length;
+          setActionSel((s) => (e.key === "ArrowDown" ? (s + 1) % n : (s - 1 + n) % n));
+          return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          void runMenuAction(actionSel);
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setActionsOpen(false);
+          return;
+        }
+        // any other key (typing) closes the menu and does what it does
+        setActionsOpen(false);
+      }
+      const max = results.length - 1;
+      const nav = ["ArrowDown", "ArrowUp", "PageDown", "PageUp"].includes(e.key);
+      if (nav && max < 0) {
+        e.preventDefault();
+        return;
+      }
+      const extend = e.shiftKey && source === "clips";
+      const move = (next: (s: number) => number) => {
+        if (extend) {
+          setSelAnchor((a) => (a == null ? selected : a));
+        } else {
+          setSelAnchor(null);
+        }
+        setSelected(next);
+      };
+      switch (e.key) {
+        case "ArrowDown":
+          e.preventDefault();
+          if (topRowActive && (calcHit || bangHit) && max >= 0) {
+            setTopRowActive(false); // step off the calc/bang row into the list
+          } else {
+            move((s) => Math.min(s + 1, max));
+          }
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          if (!topRowActive && (calcHit || bangHit) && selected === 0) {
+            setTopRowActive(true); // step back up onto the calc/bang row
+          } else {
+            move((s) => Math.max(s - 1, 0));
+          }
+          break;
+        case "PageDown":
+          e.preventDefault();
+          move((s) => Math.min(s + PAGE, max));
+          break;
+        case "PageUp":
+          e.preventDefault();
+          move((s) => Math.max(s - PAGE, 0));
+          break;
+        case "Delete":
+          if ((e.ctrlKey || e.metaKey) && source === "clips" && max >= 0) {
+            e.preventDefault();
+            void deleteSelectedClips();
+          }
+          break;
+        case "ArrowRight": {
+          // open the preview only when the caret has nowhere left to go —
+          // otherwise → keeps moving the cursor like any text field
+          const inp = inputRef.current;
+          const atEnd = !inp || (inp.selectionStart === inp.value.length && inp.selectionEnd === inp.value.length);
+          if (!previewOpen && atEnd && max >= 0 && !showSettings) {
+            e.preventDefault();
+            setPreviewOpen(true);
+          }
+          break;
+        }
+        case "ArrowLeft":
+          if (previewOpen) {
+            e.preventDefault();
+            setPreviewOpen(false);
+          }
+          break;
+        case "Enter":
+          e.preventDefault();
+          if (wsNaming && !e.ctrlKey && !e.metaKey) {
+            // the box is asking for a new workspace's name
+            void saveWsName();
+          } else if (scriptOut && !e.ctrlKey && !e.metaKey) {
+            // a script's output on screen: Enter copies it
+            const o = scriptOut.out;
+            const text = o.ok ? o.stdout.trimEnd() : [o.stdout.trimEnd(), o.stderr.trimEnd()].filter(Boolean).join("\n");
+            void invoke("copy_clip", { text }).then(finishAction);
+          } else if (emojiHits && emojiHits.length > 0) {
+            // emoji mode: Enter copies the first match (click copies any)
+            void invoke("copy_clip", { text: emojiHits[0].emoji }).then(finishAction);
+          } else if (topRowActive && noteHit && !e.ctrlKey && !e.metaKey) {
+            void saveNote();
+          } else if (topRowActive && bangHit && !e.ctrlKey && !e.metaKey) {
+            void invoke("open_repo", { url: bangHit.url }).then(finishAction);
+          } else if (topRowActive && calcHit && !e.ctrlKey && !e.metaKey) {
+            // color results copy the hex, not the whole display string
+            void takeCalc(calcHit);
+          } else if (e.ctrlKey || e.metaKey) {
+            openWeb();
+          } else if (e.shiftKey && source === "clips" && max >= 0) {
+            // Shift+Enter pastes straight into the app the palette covered
+            const range = selAnchor != null && selHi > selLo ? results.slice(selLo, selHi + 1) : [results[selected]];
+            const text = range
+              .filter((r) => r.kind === "clip" && r.clip_kind !== "image")
+              .map((r) => (r as ClipHit).content)
+              .join("\n");
+            if (text) {
+              void invoke("paste_clip", { text }).then(() => {
+                setQuery("");
+                setImageQuery(null);
+              });
+            }
+          } else if (source === "clips" && selAnchor != null && selHi > selLo) {
+            // multi-select: copy every selected clip, list order, one per line
+            const joined = results
+              .slice(selLo, selHi + 1)
+              .filter((r) => r.kind === "clip" && r.clip_kind !== "image")
+              .map((r) => (r as ClipHit).content)
+              .join("\n");
+            void invoke("copy_clip", { text: joined }).then(finishAction);
+          } else {
+            openHit(results[selected]);
+          }
+          break;
+        case "p":
+        case "P": {
+          // Ctrl+P pins/unpins the selected clip (survives pruning, sorts first)
+          if (!(e.ctrlKey || e.metaKey) || showSettings) break;
+          const r = results[selected];
+          if (r && r.kind === "clip") {
+            e.preventDefault();
+            void invoke("toggle_pin_clip", { clipId: r.id })
+              .then(() => refreshResults())
+              .catch((err) => setLastError(String(err)));
+          }
+          break;
+        }
+        case "c":
+        case "C": {
+          // Ctrl+C copies what identifies the row: a file's path (Ctrl+Shift+C
+          // the file itself), a repo's or page's URL, a clip's text, an app's
+          // launch target. Text selected in the input keeps native copy.
+          if (!(e.ctrlKey || e.metaKey) || showSettings) break;
+          const r = results[selected];
+          const inp = inputRef.current;
+          const hasSelection = inp && inp.selectionStart !== inp.selectionEnd;
+          if (!r || hasSelection) break;
+          if ((r.kind === "file" || r.kind === "video") && e.shiftKey) {
+            e.preventDefault();
+            void invoke("copy_file_clip", { path: r.path }).catch((err) => setLastError(String(err)));
+            break;
+          }
+          if (r.kind === "clip" && r.clip_kind === "image") {
+            // an image clip's identity is the image itself
+            e.preventDefault();
+            void invoke("copy_image_clip", { clipId: r.id }).catch((err) => setLastError(String(err)));
+            break;
+          }
+          const text =
+            r.kind === "file" || r.kind === "video"
+              ? r.path
+              : r.kind === "repo"
+                ? r.html_url
+                : r.kind === "bookmark" || r.kind === "history"
+                  ? r.url
+                  : r.kind === "clip"
+                    ? r.clip_kind === "text"
+                      ? r.content
+                      : null
+                    : r.kind === "app"
+                      ? r.target
+                      : null;
+          if (text != null) {
+            e.preventDefault();
+            void invoke("copy_clip", { text });
+          }
+          break;
+        }
+        case "Escape":
+          e.preventDefault();
+          if (wsNaming) {
+            setWsNaming(null); // no new workspace after all
+            setQuery("");
+          } else if (scriptOut) {
+            setScriptOut(null); // back to the list it ran from
+            void refreshResults();
+          } else if (imageQuery) {
+            setImageQuery(null); // first Esc clears the image query
+          } else if (showSettings) {
+            setShowSettings(false); // then close settings, then hide
+          } else {
+            void invoke("dismiss"); // the focus goes back where it was (#9)
+          }
+          break;
+        // note: the Settings toggle (Alt+, / Ctrl+,) lives on a window-level
+        // listener — in settings mode the input is hidden and focus can land
+        // on <body>, where this panel handler never hears the key
+        case "Tab":
+          e.preventDefault();
+          if (showSettings) break;
+          if (e.shiftKey) {
+            // Shift+Tab cycles the right-hand mode of the active source:
+            // local scope, or star sort order
+            if (source === "local") {
+              const i = SCOPES.findIndex((s) => s.id === localScope);
+              setScope(SCOPES[(i + 1) % SCOPES.length].id);
+            } else if (source === "web") {
+              const i = WEB_SCOPES.findIndex((s) => s.id === webScope);
+              setWebScope(WEB_SCOPES[(i + 1) % WEB_SCOPES.length].id);
+            } else if (source === "github-stars") {
+              const i = SORTS.findIndex((s) => s.id === repoSort);
+              const next = SORTS[(i + 1) % SORTS.length].id;
+              setRepoSort(next);
+              localStorage.setItem("magpie.sort", next);
+            }
+          } else {
+            switchSource((sourceIdx + 1) % sources.length);
+          }
+          break;
+      }
+    },
+    [results, selected, selAnchor, selLo, selHi, sourceIdx, sources, imageQuery, showSettings, source, localScope, webScope, repoSort, previewOpen, openHit, openWeb, switchSource, setScope, setWebScope, deleteSelectedClips, calcHit, bangHit, noteHit, saveNote, emojiHits, topRowActive, refreshResults, editFile, finishAction, actionsOpen, actionSel, menuActions, runMenuAction, wsNaming, saveWsName, scriptOut],
+  );
+
+  const refresh = useCallback(async () => {
+    setLastError(null);
+    try {
+      const cmd =
+        source === "github-stars"
+          ? "start_sync"
+          : source === "web"
+            ? "sync_bookmarks_now"
+            : "index_local";
+      await invoke(cmd);
+      refreshStatus();
+    } catch (e) {
+      setLastError(String(e));
+    }
+  }, [source, refreshStatus]);
+
+  const submitToken = useCallback(async () => {
+    if (!tokenInput.trim() || tokenBusy) return;
+    setTokenBusy(true);
+    setTokenError(null);
+    try {
+      await invoke<string>("set_token", { token: tokenInput.trim() });
+      setTokenInput("");
+      setTokenEditing(false);
+      await refreshStatus();
+    } catch (e) {
+      setTokenError(String(e));
+    } finally {
+      setTokenBusy(false);
+    }
+  }, [tokenInput, tokenBusy, refreshStatus]);
+
+  // Disconnect asks twice: it drops the whole star index
+  const disconnectGithub = useCallback(async () => {
+    if (!disconnectArmed) {
+      setDisconnectArmed(true);
+      return;
+    }
+    setDisconnectArmed(false);
+    try {
+      await invoke("disconnect_github");
+      setTokenError(null);
+      await refreshStatus();
+    } catch (e) {
+      setTokenError(String(e));
+    }
+  }, [disconnectArmed, refreshStatus]);
+
+  const pickQueryImage = useCallback(async () => {
+    const file = await holdOpen(() =>
+      openDialog({
+        multiple: false,
+        filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "bmp", "gif"] }],
+      }),
+    );
+    if (typeof file !== "string") return;
+    const thumb = await invoke<string | null>("preview_thumb", { path: file }).catch(() => null);
+    acceptImageQuery({
+      label: file.split(/[\\/]/).pop() ?? "image",
+      path: file,
+      thumbSrc: thumb ? `data:image/jpeg;base64,${thumb}` : undefined,
+    });
+  }, [acceptImageQuery]);
+
+  // folders whose programs join the app list (apps kept on another drive)
+  const setAppFolder = useCallback(
+    async (path: string | null, add: boolean) => {
+      const dir = path ?? (await holdOpen(() => openDialog({ directory: true, multiple: false })));
+      if (typeof dir !== "string") return;
+      try {
+        await invoke<string[]>("set_app_folder", { path: dir, add });
+        setLastError(null);
+        await refreshStatus();
+      } catch (e) {
+        setLastError(String(e));
+      }
+    },
+    [refreshStatus],
+  );
+
+  // "Add common places": opened as a checklist under the folder list. null
+  // while the backend looks (it counts files, which takes a moment)
+  const [placesOpen, setPlacesOpen] = useState(false);
+  const [places, setPlaces] = useState<CommonPlace[] | null>(null);
+  const [placesPick, setPlacesPick] = useState<ReadonlySet<string>>(new Set());
+  const [placesBusy, setPlacesBusy] = useState(false);
+  const openPlaces = useCallback(async () => {
+    setPlacesOpen(true);
+    setPlaces(null);
+    setPlacesPick(new Set());
+    try {
+      setPlaces(await invoke<CommonPlace[]>("common_places"));
+    } catch (e) {
+      setPlaces([]);
+      setLastError(String(e));
+    }
+  }, []);
+  const addPlaces = useCallback(async () => {
+    setPlacesBusy(true);
+    try {
+      // all at once: one index pass takes them in together
+      const [list, failed] = await invoke<[FolderInfo[], string[]]>("add_folders", {
+        paths: [...placesPick],
+      });
+      setFolders(list);
+      setLastError(failed.length ? failed.join("\n") : null);
+    } catch (e) {
+      setLastError(String(e));
+    }
+    setPlacesBusy(false);
+    setPlacesOpen(false);
+  }, [placesPick]);
+
+  const addFolder = useCallback(async () => {
+    const dir = await holdOpen(() => openDialog({ directory: true, multiple: false }));
+    if (typeof dir !== "string") return;
+    try {
+      setFolders(await invoke<FolderInfo[]>("add_folder", { path: dir }));
+      setLastError(null);
+    } catch (e) {
+      const message = String(e);
+      if (/contains already-indexed folder/i.test(message)) {
+        const agreed = window.confirm(
+          'В этой папке уже проиндексированы отдельные подпапки.\n\n' +
+          'Объединить их под выбранной родительской папкой?\n' +
+          'Существующие файлы, поисковый текст и векторы сохранятся.\n' +
+          'Облачные файлы могут скачиваться локально и занимать место на диске.'
+        );
+        if (!agreed) return;
+        try {
+          setFolders(await invoke<FolderInfo[]>('consolidate_nested_folders', { path: dir }));
+          setLastError(null);
+        } catch (mergeError) { setLastError(explainErrorRu(mergeError)); }
+      } else { setLastError(explainErrorRu(e)); }
+    }
+  }, []);
+
+  const captureHotkey = useCallback((e: React.KeyboardEvent) => {
+    const r = chordFromEvent(e);
+    if (r.ignore) return;
+    if (r.clear) {
+      setHotkeyDraft("");
+      setHotkeyMsg(null);
+      return;
+    }
+    if (r.error) {
+      setHotkeyMsg(r.error);
+      return;
+    }
+    setHotkeyDraft(r.chord ?? "");
+    setHotkeyMsg(null);
+  }, []);
+
+  const applyHotkey = useCallback(async () => {
+    if (!hotkeyDraft) return;
+    try {
+      await invoke("set_hotkey", { hotkey: hotkeyDraft });
+      setHotkeyMsg("saved");
+      setHotkeyDraft("");
+      refreshStatus();
+    } catch (e) {
+      setHotkeyMsg(String(e));
+    }
+  }, [hotkeyDraft, refreshStatus]);
+
+  // the same recorder, for the selection-search chord
+  const captureSelectionHotkey = useCallback((e: React.KeyboardEvent) => {
+    const r = chordFromEvent(e);
+    if (r.ignore) return;
+    if (r.clear) {
+      setSelDraft("");
+      setSelMsg(null);
+      return;
+    }
+    if (r.error) {
+      setSelMsg(r.error);
+      return;
+    }
+    setSelDraft(r.chord ?? "");
+    setSelMsg(null);
+  }, []);
+
+  const applySelectionHotkey = useCallback(
+    async (chord: string) => {
+      try {
+        await invoke("set_selection_hotkey", { hotkey: chord });
+        setSelMsg("saved");
+        setSelDraft("");
+        refreshStatus();
+      } catch (e) {
+        setSelMsg(String(e));
+      }
+    },
+    [refreshStatus],
+  );
+
+  // the backend composes the command (URL + bearer header) so the settings
+  // row and the docs never drift from what the server actually expects
+  const copyMcpCommand = useCallback(async () => {
+    if (!status?.mcp_command) return;
+    try {
+      await invoke("copy_clip", { text: status.mcp_command });
+      setMcpMsg("copied");
+    } catch (e) {
+      setMcpMsg(String(e));
+    }
+  }, [status?.mcp_command]);
+  const rotateMcpToken = useCallback(async () => {
+    try {
+      setMcpMsg(null);
+      await invoke("rotate_mcp_token");
+      await refreshStatus();
+      setTimeout(() => void refreshStatus(), 600);
+      setMcpMsg("new token issued; add the server again in your clients");
+    } catch (e) {
+      setMcpMsg(String(e));
+    }
+  }, [refreshStatus]);
+  const applyNotePath = useCallback(async () => {
+    try {
+      await invoke("set_note_path", { path: notePathDraft });
+      setNoteMsg("saved");
+      setNotePathDraft("");
+      refreshStatus();
+    } catch (e) {
+      setNoteMsg(String(e));
+    }
+  }, [notePathDraft, refreshStatus]);
+
+  const applyFileCap = useCallback(
+    async (mb: number) => {
+      try {
+        await invoke("set_max_file_mb", { mb });
+        await refreshStatus();
+      } catch (e) {
+        setLastError(String(e));
+      }
+    },
+    [refreshStatus],
+  );
+
+  const removeFolder = useCallback(async (id: number) => {
+    try {
+      setFolders(await invoke<FolderInfo[]>("remove_folder", { folderId: id }));
+      // keep the counts in the status line in step with the list
+      await refreshStatus();
+    } catch (e) {
+      setLastError(String(e));
+    }
+  }, [refreshStatus]);
+
+  const rebuildFolder = useCallback(
+    async (id: number) => {
+      setLastError(null);
+      try {
+        await invoke("rebuild_folder", { folderId: id });
+        await refreshFolders();
+      } catch (e) {
+        setLastError(String(e));
+      }
+    },
+    [refreshFolders],
+  );
+
+  const doCheckUpdate = useCallback(async (silent: boolean) => {
+    // periodic re-checks must not yank the UI out of an install in progress
+    if (silent && updPhaseRef.current === "downloading") return;
+    setUpdError(null);
+    if (!silent) setUpdPhase("checking");
+    try {
+      const u = await checkUpdate();
+      if (u) {
+        updRef.current = u;
+        setUpdVersion(u.version);
+        setUpdPhase("available");
+      } else if (!silent) {
+        setUpdPhase("none");
+      }
+    } catch (e) {
+      if (!silent) {
+        setUpdPhase("error");
+        setUpdError(String(e));
+      }
+    }
+  }, []);
+
+  const doInstallUpdate = useCallback(async () => {
+    const u = updRef.current;
+    if (!u) return;
+    setUpdPhase("downloading");
+    setUpdPct(0);
+    try {
+      let total = 0;
+      let done = 0;
+      await u.downloadAndInstall((ev) => {
+        if (ev.event === "Started") {
+          total = ev.data.contentLength ?? 0;
+        } else if (ev.event === "Progress") {
+          done += ev.data.chunkLength;
+          if (total > 0) setUpdPct(Math.min(100, Math.round((done * 100) / total)));
+        } else if (ev.event === "Finished") {
+          setUpdPct(100);
+        }
+      });
+      // not plugin-process's relaunch: the backend has to release the
+      // single-instance lock first, or the replacement process quits on startup
+      await invoke("restart_for_update");
+    } catch (e) {
+      setUpdPhase("error");
+      setUpdError(String(e));
+    }
+  }, []);
+
+  // quiet startup check, delayed so it never competes with model init —
+  // then every 24h while resident (the app is a tray dweller; a launch-only
+  // check would miss releases for however long the machine stays up)
+  useEffect(() => {
+    const t = setTimeout(() => doCheckUpdate(true), 15_000);
+    const iv = setInterval(() => doCheckUpdate(true), 24 * 60 * 60 * 1000);
+    return () => {
+      clearTimeout(t);
+      clearInterval(iv);
+    };
+  }, [doCheckUpdate]);
+
+  // mirror the pending update onto the tray: red-dot icon + menu entry
+  useEffect(() => {
+    if (updPhase === "available") {
+      invoke("set_update_badge", { version: updVersion }).catch(() => {});
+    }
+  }, [updPhase, updVersion]);
+
+  const rebuildStars = useCallback(async () => {
+    setLastError(null);
+    try {
+      await invoke("rebuild_stars");
+      await refreshStatus();
+    } catch (e) {
+      setLastError(String(e));
+    }
+  }, [refreshStatus]);
+
+  const busy =
+    source === "github-stars"
+      ? starsProgress !== null || (status?.syncing ?? false)
+      : localProgress !== null || (status?.local_indexing ?? false);
+  const modelWarming = status !== null && status.model.startsWith("loading");
+  const modelFailed = status !== null && status.model.startsWith("failed");
+
+  const footerStatus = notice
+    ? notice
+    : lastError
+    ? `Ошибка: ${explainErrorRu(lastError)}`
+    : modelFailed
+      ? t("model download failed, keyword search only (set a mirror in settings)")
+      : status?.semantic_paused
+        ? t("semantic search paused, keyword search only")
+      : modelWarming
+        ? "Подготовка текстовой модели…"
+        : source === "local" && status?.image_model === "loading"
+          ? "Подготовка модели изображений…"
+          : status
+            ? source === "github-stars"
+              ? tf("{n} repos indexed", { n: status.repo_count })
+              : source === "web"
+                ? tf("{a} bookmarks · {b} history", {
+                    a: status.bookmark_count,
+                    b: status.history_count,
+                  })
+                : source === "clips"
+                  ? status.clipboard_enabled
+                    ? tf("{n} clips recorded", { n: status.clip_count })
+                    : t("clipboard history is off — enable it in settings")
+                  : tf("{n} files indexed", { n: status.file_count })
+            : "";
+
+  // progress is scoped to the active source: stars sync details only show on
+  // the GitHub Stars tab, local indexing only on Local Files
+  const indexHint =
+    source === "github-stars"
+      ? starsProgress
+        ? starsProgressLabel(starsProgress)
+        : null
+      : localProgress
+        ? localProgressLabel(localProgress)
+        : null;
+
+  // footer key hints, each with how early it gives way (higher first, 0
+  // never) when the status on the right would be cut off: English labels,
+  // a long notice or a narrow window used to push the status out of view
+  const footerHints: { key: string; drop: number; node: ReactNode }[] = [
+    { key: "actions", drop: 0, node: <><Keys keys={[MOD, "K"]} /> {t("actions")}</> },
+    { key: "open", drop: 7, node: <><kbd>⏎</kbd> {source === "clips" ? t("copy") : t("open")}</> },
+    { key: "source", drop: 4, node: <><kbd>tab</kbd> {t("source")}</> },
+    ...(source === "clips"
+      ? [
+          { key: "paste", drop: 2, node: <><Keys keys={["⇧", "⏎"]} /> {t("paste")}</> },
+          { key: "select", drop: 6, node: <><Keys keys={["⇧", "↑↓"]} /> {t("select")}</> },
+          { key: "delete", drop: 3, node: <><Keys keys={[MOD, "⌦"]} /> {t("delete")}</> },
+        ]
+      : []),
+    ...(source === "local" || source === "web" || source === "github-stars"
+      ? [{ key: "scope", drop: 3, node: <><Keys keys={["⇧", "tab"]} /> {source === "github-stars" ? t("sort") : t("scope")}</> }]
+      : []),
+    ...(results.length > 0 && !showSettings
+      ? [{ key: "preview", drop: 5, node: <><kbd>{previewOpen ? "←" : "→"}</kbd> {previewOpen ? t("close preview") : t("preview")}</> }]
+      : []),
+    {
+      key: "settings",
+      drop: 0,
+      node: (
+        <>
+          <Keys keys={[IS_MAC ? "⌘" : "Alt", ","]} /> {t("settings")}
+          {(updPhase === "available" || updPhase === "downloading") && (
+            <i className="upd-dot" title={tf("Version {v} is available.", { v: updVersion ?? "" })} />
+          )}
+        </>
+      ),
+    },
+    { key: "web", drop: 2, node: <><Keys keys={[MOD, "⏎"]} /> {t("web")}</> },
+  ];
+  const dropOrder = footerHints
+    .map((h, i) => ({ key: h.key, drop: h.drop, i }))
+    .filter((h) => h.drop > 0)
+    .sort((a, b) => b.drop - a.drop || b.i - a.i)
+    .map((h) => h.key);
+  const droppedHints = new Set(dropOrder.slice(0, hintsDropped));
+  const hintsSignature = `${footerHints.map((h) => h.key).join()}|${footerStatus}|${t("actions")}`;
+  // anything that changes what the footer holds starts from all hints again
+  useLayoutEffect(() => {
+    setHintsDropped(0);
+  }, [hintsSignature]);
+  // then, before paint, give way one hint at a time until the status fits.
+  // Checked after every render: widths also move when a font finishes
+  // loading, which no dependency list sees, and the browser lays the page
+  // out before painting anyway, so reading it here costs no extra layout
+  useLayoutEffect(() => {
+    const st = footerStatusRef.current;
+    if (st && st.scrollWidth > st.clientWidth && hintsDropped < dropOrder.length) {
+      setHintsDropped((n) => n + 1);
+    }
+  });
+  // and once the fonts are in, measure again from all hints (the tick makes
+  // sure that re-render happens even when nothing had given way yet)
+  useEffect(() => {
+    void document.fonts?.ready.then(() => {
+      setHintsDropped(0);
+      setFontsTick((n) => n + 1);
+    });
+  }, []);
+
+  // a fresh install opens here: what magpie does, then whether to download
+  // the semantic model (#8). Nothing is downloaded before this is answered.
+  if (status?.semantic === "undecided") {
+    return (
+      <Welcome
+        panelRef={panelRef}
+        hotkey={status.hotkey}
+        onChoose={async (on) => {
+          try {
+            await invoke("set_semantic", { enabled: on });
+          } catch (e) {
+            setLastError(String(e));
+          }
+          await refreshStatus();
+        }}
+      />
+    );
+  }
+
+  return (
+    <div
+      className={`panel ${showSettings ? "settings-mode" : ""} ${
+        paneLaidOut ? "preview-open" : ""
+      }`}
+      style={userSized ? {
+        display: "flex", flexDirection: "column", width: "100vw", height: "100vh",
+        maxHeight: "100vh", boxSizing: "border-box",
+      } : { display: "flex", flexDirection: "column", maxHeight: 620,
+        ...(paneCatchingUp ? { minWidth: WINDOW_WIDTH_PREVIEW } : {}),
+      }}
+      ref={panelRef}
+      onKeyDown={onKeyDown}
+    >
+      <div className="ls-mac-context" role="status" data-tauri-drag-region>
+        <span className="ls-mac-dot" aria-hidden="true" />
+        LocalSearch DEV Decision <span className="ls-mac-divider">·</span> {status?.parallel_test ? "изолированные проверки" : "боевое тестирование"}
+        <span className="ls-mac-context-right">Отдельный индекс DEV</span>
+      </div>
+      <div className="source-row" data-tauri-drag-region>
+        {sources.map((s, i) => (
+          <button
+            key={s.id}
+            className={`source ${i === sourceIdx ? "active" : ""}`}
+            onClick={() => switchSource(i)}
+            tabIndex={-1}
+            title={
+              tabKeys === "off" || i >= 9
+                ? undefined
+                : `${tabKeys === "alt" ? (IS_MAC ? "⌥" : "Alt+") : IS_MAC ? "⌘" : "Ctrl+"}${i + 1}`
+            }
+          >
+            {t(s.label)}
+          </button>
+        ))}
+        {source === "local" && (
+          <span className="sort-group">
+            {SCOPES.map((s) => (
+              <button
+                key={s.id}
+                className={`source ${localScope === s.id ? "active" : ""}`}
+                onClick={() => setScope(s.id)}
+                tabIndex={-1}
+                title={tf("Search {s} (Shift+Tab cycles)", { s: t(s.label) })}
+              >
+                {t(s.label)}
+              </button>
+            ))}
+          </span>
+        )}
+        {source === "web" && (
+          <span className="sort-group">
+            {WEB_SCOPES.map((s) => (
+              <button
+                key={s.id}
+                className={`source ${webScope === s.id ? "active" : ""}`}
+                onClick={() => setWebScope(s.id)}
+                tabIndex={-1}
+                title={tf("Search {s} (Shift+Tab cycles)", { s: t(s.label) })}
+              >
+                {t(s.label)}
+              </button>
+            ))}
+          </span>
+        )}
+        {source === "github-stars" && (
+          <span className="sort-group">
+            {SORTS.map((s) => (
+              <button
+                key={s.id}
+                className={`source ${repoSort === s.id ? "active" : ""}`}
+                onClick={() => {
+                  setRepoSort(s.id);
+                  localStorage.setItem("magpie.sort", s.id);
+                  inputRef.current?.focus();
+                }}
+                tabIndex={-1}
+                title={tf("Sort by {s}", { s: t(s.label) })}
+              >
+                {t(s.label)}
+              </button>
+            ))}
+          </span>
+        )}
+      </div>
+
+      <div className="input-row">
+        <svg className="search-icon" viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="6.5" cy="6.5" r="4.75" fill="none" stroke="currentColor" strokeWidth="1.5" />
+          <line x1="10.5" y1="10.5" x2="14" y2="14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+        </svg>
+        {imageQuery && (
+          <span className="img-chip">
+            {imageQuery.thumbSrc ? (
+              <img className="chip-thumb" src={imageQuery.thumbSrc} alt="" />
+            ) : (
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.5" />
+                <circle cx="5.5" cy="6.5" r="1.25" fill="currentColor" />
+                <path d="M2.5 12l3.5-3.5 2.5 2.5 3-3 2 2" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+              </svg>
+            )}
+            <span className="img-chip-label">{imageQuery.label}</span>
+            <button onClick={() => setImageQuery(null)} aria-label={t("Clear")}>
+              ✕
+            </button>
+          </span>
+        )}
+        <input
+          ref={inputRef}
+          className="query"
+          value={voiceMode === "recording" || voiceMode === "transcribing" ? voicePreview : query}
+          readOnly={voiceMode !== "idle"}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            if (imageQuery) setImageQuery(null); // typing replaces the image query
+          }}
+          placeholder={
+            imageQuery
+              ? t("Searching by image similarity")
+              : source === "web"
+              ? t("Search bookmarks and browser history")
+              : source === "clips"
+              ? t("Search your clipboard history")
+              : source === "github-stars"
+                ? status && status.repo_count > 0
+                  ? tf("Search {n} starred repos", { n: status.repo_count })
+                  : t("Search your stars")
+                : localScope === "videos"
+                  ? t("Search videos by name, or describe a scene")
+                  : localScope === "images"
+                  ? t("Describe the image, or pick / drop / paste one")
+                  : status && status.file_count > 0
+                    ? tf("Search {n} local files, drop or paste an image", {
+                        n: status.file_count,
+                      })
+                    : t("Search indexed folders")
+          }
+          autoFocus
+          spellCheck={false}
+          autoCorrect="off"
+          autoCapitalize="off"
+        />
+        {todayShown && todayLine && (
+          // today, in the room the empty box leaves on the right (#13); the
+          // placeholder gives way with an ellipsis rather than run under it
+          <span className="query-date" aria-hidden="true">
+            {todayText(todayLine, currentLang())}
+          </span>
+        )}
+        {showWebHint && (
+          <span
+            ref={queryHintRef}
+            className="query-hint"
+            style={{ left: queryHintLeft ?? 0, visibility: queryHintLeft == null ? "hidden" : "visible" }}
+            aria-hidden="true"
+          >
+            <Keys keys={[MOD, "⏎"]} /> {t("search in browser")}
+          </span>
+        )}
+        {source === "local" && !imageQuery && (
+          <button
+            className="icon-btn"
+            tabIndex={0}
+            disabled={voiceMode === "starting" || voiceMode === "transcribing"}
+            onClick={() => {
+              if (voiceMode === "recording") void stopVoiceCapture();
+              else if (voiceMode === "idle") void startVoiceCapture();
+            }}
+            onKeyDown={(e) => e.stopPropagation()}
+            title={voiceMode === "recording" ? "Остановить голосовую запись" : "Голосовой поиск — FluidVoice"}
+            aria-label={voiceMode === "recording" ? "Остановить запись" : "Начать голосовой поиск"}
+            aria-pressed={voiceMode === "recording"}
+          >
+            {voiceMode === "transcribing" || voiceMode === "starting" ? (
+              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="3 2" /></svg>
+            ) : (
+              <svg viewBox="0 0 16 16" aria-hidden="true" style={voiceMode === "recording" ? { color: "#e05252" } : undefined}>
+                <rect x="5.3" y="1.5" width="5.4" height="8" rx="2.7" fill="none" stroke="currentColor" strokeWidth="1.4" />
+                <path d="M3.1 7.3a4.9 4.9 0 0 0 9.8 0M8 12.2v2.2M5.3 14.4h5.4" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+              </svg>
+            )}
+          </button>
+        )}
+        {source === "local" && !imageQuery && (
+          <button
+            className="icon-btn"
+            onClick={pickQueryImage}
+            title={t("Search with an image file")}
+            aria-label={t("Search with an image file")}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.5" />
+              <circle cx="5.5" cy="6.5" r="1.25" fill="currentColor" />
+              <path d="M2.5 12l3.5-3.5 2.5 2.5 3-3 2 2" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+            </svg>
+          </button>
+        )}
+        <button
+          className={`icon-btn ${busy ? "spinning" : ""}`}
+          onClick={refresh}
+          disabled={busy || needsToken}
+          title={source === "github-stars" ? t("Re-fetch starred repos") : t("Re-scan folders")}
+          aria-label="Обновить"
+        >
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 1.5v3h-3"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </button>
+      </div>
+
+      {voiceMode !== "idle" && (
+        <div role="status" aria-live="polite" style={{ padding: "4px 18px", fontSize: 12, color: "var(--muted, #999)" }}>
+            {voiceMode === "recording"
+              ? (voicePreview
+                ? "● Предварительный текст — говори дальше; нажми микрофон для поиска"
+                : "● Слушаю… текст появится через несколько секунд; нажми микрофон для завершения")
+              : voiceMode === "starting" ? "Подключаю микрофон…"
+                : "Уточняю окончательный текст через FluidVoice…"}
+        </div>
+      )}
+      {voiceError && source === "local" && (
+        <div role="alert" style={{ padding: "4px 18px", fontSize: 12, color: "#e05252" }}>
+          {explainErrorRu(voiceError)}
+        </div>
+      )}
+
+      {/* the tip or the day's couplet, right under the box it is about: below
+          the list it sat under the pins and the cards, near the footer */}
+      {tipsIdle && (
+        <div className="tip-row">
+          {/* keyed so React swaps the node and the enter animation replays */}
+          <span key={tip} className={`tip-text ${tipPhase === "out" ? "leaving" : ""}`}>
+            <span className="tip-bulb">💡</span> {t(tip)}
+          </span>
+        </div>
+      )}
+
+      {indexHint && <div className="index-hint">{indexHint}</div>}
+      {source === "local" && !imageQuery && query.trim().length > 2 &&
+        (localScope === "all" || localScope === "images" || localScope === "videos") &&
+        status && status.image_model !== "ready" && (
+          <div className="ls-visual-notice" role="status">
+            Визуальный поиск сейчас недоступен ({modelStatusRu(status.image_model)}).
+            Текущая выдача может не включать предметы и сцены на фото или в видео.
+          </div>
+      )}
+
+      {needsToken && !showSettings && (
+        <button className="collapse-bar" onClick={() => setShowSettings(true)}>
+          <span>{t("Connect GitHub to sync your stars")}</span>
+          <svg className="chevron" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+      )}
+
+      {source === "local" && !showSettings && folders.length === 0 && (
+        <button className="collapse-bar" onClick={() => setShowSettings(true)}>
+          <span>{t("No folders indexed yet, add some to search locally")}</span>
+          <svg className="chevron" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+      )}
+
+      {showSettings ? (
+        <div className="card settings-page">
+          <div className="card-head" data-tauri-drag-region>
+            <p className="card-title settings-title">
+              {t("Settings")}
+              <span className="ver" title="Изолированная сборка LocalSearch DEV Decision">DEV Decision</span>
+            </p>
+            <button
+              className="icon-btn"
+              onClick={() => setShowSettings(false)}
+              title={t("Back to search (Esc)")}
+              aria-label="Закрыть настройки"
+            >
+              ✕
+            </button>
+          </div>
+
+          {/* section tabs (#6): each part of the app has its own page */}
+          <div className="settings-nav" role="tablist">
+            {SETTINGS_SECTIONS.map((s) => (
+              <button
+                key={s.id}
+                role="tab"
+                aria-selected={settingsTab === s.id}
+                className={`source ${settingsTab === s.id ? "active" : ""}`}
+                onClick={() => setSettingsTab(s.id)}
+              >
+                {t(s.label)}
+                {/* a new version waits: the About page has the update button */}
+                {s.id === "about" && (updPhase === "available" || updPhase === "downloading") && (
+                  <i className="upd-dot" title={tf("Version {v} is available.", { v: updVersion ?? "" })} />
+                )}
+              </button>
+            ))}
+          </div>
+
+          {/* only the page scrolls; the title and the section tabs stay */}
+          <div className="settings-body" ref={settingsPageRef}>
+            {settingsTab === "general" && (
+              <>
+                <p className="set-eyebrow">{t("Appearance & behavior")}</p>
+                <div className="set-group">
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Theme")}</span>
+                    </div>
+                    <div className="pill-row">
+                      {THEMES.map((th) => (
+                        <button
+                          key={th}
+                          className={`source ${theme === th ? "active" : ""}`}
+                          onClick={() => setTheme(th)}
+                        >
+                          {t(th)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Language")}</span>
+                      <span className="set-desc">
+                        {t("Palette and settings text; the tray menu follows.")}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {(
+                        [
+                          { id: "auto", label: t("auto") },
+                          { id: "ru", label: "Русский" },
+                           { id: "en", label: "English" },
+                        ] as { id: LangPref; label: string }[]
+                      ).map((o) => (
+                        <button
+                          key={o.id}
+                          className={`source ${langPref === o.id ? "active" : ""}`}
+                          onClick={() => chooseLang(o.id)}
+                        >
+                          {o.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Launch at login")}</span>
+                      <span className="set-desc">
+                        {t("Start magpie in the tray when you log in.")}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${autostart === o.on ? "active" : ""}`}
+                          disabled={autostart == null}
+                          onClick={async () => {
+                            try {
+                              await invoke("set_autostart", { on: o.on });
+                              setAutostart(await invoke<boolean>("get_autostart"));
+                            } catch (e) {
+                              setLastError(String(e));
+                            }
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Hide on click-out")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "The palette goes away when another window takes focus. Turn off to drag files in from other windows.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${hideOnBlur === o.on ? "active" : ""}`}
+                          onClick={() => {
+                            setHideOnBlur(o.on);
+                            try {
+                              localStorage.setItem("magpie.hideonblur", o.on ? "1" : "0");
+                            } catch {
+                              /* preference just won't persist */
+                            }
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Launch tips")}</span>
+                      <span className="set-desc">
+                        {t("A one-line tip below the empty search box, fresh on every summon.")}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${showTips === o.on ? "active" : ""}`}
+                          onClick={() => {
+                            setShowTips(o.on);
+                            try {
+                              localStorage.setItem(TIPS_KEY, o.on ? "1" : "0");
+                            } catch {
+                              /* preference just won't persist */
+                            }
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Recent opens on the empty box")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "With nothing typed, each tab lists what you opened from it most recently. Local also lists files in your folders that are new or changed this week.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${recentsOn === o.on ? "active" : ""}`}
+                          onClick={() => {
+                            setRecentsOn(o.on);
+                            setRecentsEnabled(o.on);
+                            // the list behind the settings page was built under the
+                            // old setting; rebuild it now, or it lingers until the
+                            // next keystroke or tab switch
+                            void refreshResults();
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("From long ago on the empty box")}</span>
+                      <span className="set-desc">
+                        {tf(
+                          "With nothing typed, a bookmark and a starred repo you kept long ago come up first, different ones each day: Web shows the bookmark, Stars the repo, Local both. {key} on one can stop it from coming back.",
+                          { key: IS_MAC ? "⌘K" : "Ctrl+K" },
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${recallOn === o.on ? "active" : ""}`}
+                          onClick={() => {
+                            setRecallOn(o.on);
+                            setRecallEnabled(o.on);
+                            void refreshResults();
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Date in the search box")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "With nothing typed, the right of the search box shows today's date and weekday, with the Chinese calendar in Chinese.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${todayOn === o.on ? "active" : ""}`}
+                          onClick={() => {
+                            setTodayOn(o.on);
+                            setTodayLineEnabled(o.on);
+                            void refreshResults();
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <p className="set-eyebrow">{t("Script commands")}</p>
+                <div className="set-group">
+                  <div className="set-row stack">
+                    <div className="set-head">
+                      <div className="set-label">
+                        <span className="set-name">{t("Scripts folder")}</span>
+                        <span className="set-desc">
+                          {t(
+                            "A script in this folder becomes a command: put its name at the top in a comment, as # @raycast.title My Command. Raycast's script commands work as they are.",
+                          )}
+                        </span>
+                      </div>
+                    </div>
+                    {scriptsInfo && (
+                      <div className="scripts-folder">
+                        <span className="mono-wrap">{scriptsInfo.dir}</span>
+                        <span className="set-desc">{tf("{n} scripts found", { n: scriptsInfo.count })}</span>
+                      </div>
+                    )}
+                    <div className="pill-row">
+                      <button
+                        className="ghost-btn"
+                        onClick={() =>
+                          invoke("open_scripts_folder")
+                            .then(loadScriptsInfo)
+                            .catch((e) => setLastError(String(e)))
+                        }
+                      >
+                        {t("Open the scripts folder")}
+                      </button>
+                      <button
+                        className="ghost-btn"
+                        onClick={async () => {
+                          const dir = await holdOpen(() => openDialog({ directory: true, multiple: false }));
+                          if (typeof dir !== "string") return;
+                          try {
+                            await invoke("set_scripts_folder", { dir });
+                            await loadScriptsInfo();
+                          } catch (e) {
+                            setLastError(String(e));
+                          }
+                        }}
+                      >
+                        {t("Use another folder…")}
+                      </button>
+                      {scriptsInfo?.custom && (
+                        <button
+                          className="ghost-btn"
+                          onClick={() =>
+                            invoke("set_scripts_folder", { dir: null })
+                              .then(loadScriptsInfo)
+                              .catch((e) => setLastError(String(e)))
+                          }
+                        >
+                          {t("Back to the default folder")}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <p className="set-eyebrow">{t("Shortcuts & tabs")}</p>
+                <div className="set-group">
+                  <div className="set-row stack">
+                    <div className="set-label">
+                      <span className="set-name">{t("Summon shortcut")}</span>
+                      <span className="set-desc">
+                        {t("Currently")} <kbd>{status?.hotkey ?? "Alt+Space"}</kbd>.{" "}
+                        {t(
+                          "Click and press a new combination; Backspace clears. OS-reserved chords (like ⌘Space) can't be captured.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="token-row">
+                      <input
+                        className="token-input"
+                        value={hotkeyDraft}
+                        onChange={() => {}}
+                        onKeyDown={captureHotkey}
+                        placeholder={t("press keys…")}
+                        spellCheck={false}
+                      />
+                      {hotkeyDraft && (
+                        <button
+                          className="icon-btn"
+                          onClick={() => {
+                            setHotkeyDraft("");
+                            setHotkeyMsg(null);
+                          }}
+                          title={t("Clear")}
+                          aria-label="Очистить сочетание клавиш"
+                        >
+                          ✕
+                        </button>
+                      )}
+                      <button className="primary-btn" onClick={applyHotkey} disabled={!hotkeyDraft}>
+                        {t("Apply")}
+                      </button>
+                    </div>
+                    {hotkeyMsg && (
+                      // hotkeyMsg holds internal sentinels ("saved") or raw errors;
+                      // translate known sentinels at render time only
+                      <p className={hotkeyMsg === "saved" ? "set-empty" : "error-line"}>
+                        {hotkeyMsg === "saved" ? t(hotkeyMsg) : explainErrorRu(hotkeyMsg)}
+                      </p>
+                    )}
+                    {status?.hotkey !== "Alt+Space" && (
+                      <div className="set-links">
+                        <button
+                          className="link-btn"
+                          onClick={async () => {
+                            try {
+                              await invoke("set_hotkey", { hotkey: "Alt+Space" });
+                              setHotkeyDraft("");
+                              setHotkeyMsg("saved");
+                              refreshStatus();
+                            } catch (e) {
+                              setHotkeyMsg(String(e));
+                            }
+                          }}
+                        >
+                          {t("Reset to Alt+Space")}
+                        </button>
+                      </div>
+                    )}
+                    {status?.wayland_hotkey && <WaylandHotkey info={status.wayland_hotkey} />}
+                  </div>
+
+                  <div className="set-row stack">
+                    <div className="set-label">
+                      <span className="set-name">{t("Search selection shortcut")}</span>
+                      <span className="set-desc">
+                        {status?.hotkey_selection ? (
+                          <>
+                            {t("Currently")} <kbd>{status.hotkey_selection}</kbd>.{" "}
+                          </>
+                        ) : (
+                          <>{t("Removed.")} </>
+                        )}
+                        {t(
+                          "Press it in any app to look up the selected text: magpie copies the selection and opens with it as the query.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="token-row">
+                      <input
+                        className="token-input"
+                        value={selDraft}
+                        onChange={() => {}}
+                        onKeyDown={captureSelectionHotkey}
+                        placeholder={t("press keys…")}
+                        spellCheck={false}
+                      />
+                      <button
+                        className="primary-btn"
+                        onClick={() => void applySelectionHotkey(selDraft)}
+                        disabled={!selDraft}
+                      >
+                        {t("Apply")}
+                      </button>
+                      {status?.hotkey_selection && (
+                        <button className="ghost-btn" onClick={() => void applySelectionHotkey("")}>
+                          {t("Remove")}
+                        </button>
+                      )}
+                    </div>
+                    {selMsg && (
+                      <p className={selMsg === "saved" ? "set-empty" : "error-line"}>{selMsg === "saved" ? t(selMsg) : explainErrorRu(selMsg)}</p>
+                    )}
+                    {status && status.hotkey_selection !== status.hotkey_selection_default && (
+                      <div className="set-links">
+                        <button
+                          className="link-btn"
+                          onClick={() => void applySelectionHotkey(status.hotkey_selection_default)}
+                        >
+                          {tf("Reset to {k}", { k: status.hotkey_selection_default })}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Jump to a tab")}</span>
+                      <span className="set-desc">
+                        {t("A modifier plus the tab's number opens it directly, in the order the tabs are shown.")}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {TAB_KEYS.map((o) => (
+                        <button
+                          key={o.id}
+                          className={`source ${tabKeys === o.id ? "active" : ""}`}
+                          onClick={() => {
+                            setTabKeys(o.id);
+                            try {
+                              localStorage.setItem("magpie.tabkeys", o.id);
+                            } catch {
+                              /* preference just won't persist */
+                            }
+                          }}
+                        >
+                          {o.id === "off" ? t("off") : o.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row stack">
+                    <div className="set-label">
+                      <span className="set-name">{t("Tabs")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "Tick which sources appear as tabs (at least one stays on). Drag the handle (or use the arrows) to reorder; ★ marks the tab that opens on launch.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="tab-order">
+                      {orderedSources(sourceOrder).map((s, i, all) => {
+                        const hidden = hiddenTabs.includes(s.id);
+                        const lastVisible = !hidden && all.filter((x) => !hiddenTabs.includes(x.id)).length <= 1;
+                        return (
+                          <div
+                            key={s.id}
+                            className={`tab-row ${dragTab === s.id ? "dragging" : ""} ${hidden ? "hidden-tab" : ""}`}
+                            onPointerEnter={() => {
+                              // live reorder: while a drag is held, entering another
+                              // row moves the dragged tab into that slot
+                              if (dragTab && dragTab !== s.id) commitDrag(dragTab, s.id);
+                            }}
+                          >
+                            <span
+                              className="drag-handle"
+                              aria-hidden="true"
+                              onPointerDown={(e) => {
+                                e.preventDefault();
+                                setDragTab(s.id);
+                              }}
+                            >
+                              ⠿
+                            </span>
+                            <input
+                              type="checkbox"
+                              className="tab-check"
+                              checked={!hidden}
+                              disabled={lastVisible}
+                              onChange={() => toggleTabVisible(s.id)}
+                              title={
+                                lastVisible
+                                  ? t("At least one tab must stay visible")
+                                  : hidden
+                                    ? tf("Show {s}", { s: t(s.label) })
+                                    : tf("Hide {s}", { s: t(s.label) })
+                              }
+                              aria-label={`Show ${s.label} as a tab`}
+                            />
+                            <button
+                              className={`star-btn ${defaultTab === s.id ? "on" : ""}`}
+                              onClick={() => chooseDefaultTab(s.id)}
+                              disabled={hidden}
+                              title={
+                                defaultTab === s.id
+                                  ? t("Opens on launch")
+                                  : t("Make this the launch tab")
+                              }
+                              aria-label={`Make ${s.label} the default tab`}
+                            >
+                              {defaultTab === s.id ? "★" : "☆"}
+                            </button>
+                            <span className="tab-name">{t(s.label)}</span>
+                            <button
+                              className="tab-move"
+                              onClick={() => moveTab(s.id, -1)}
+                              disabled={i === 0}
+                              aria-label={`Move ${s.label} up`}
+                            >
+                              ↑
+                            </button>
+                            <button
+                              className="tab-move"
+                              onClick={() => moveTab(s.id, 1)}
+                              disabled={i === all.length - 1}
+                              aria-label={`Move ${s.label} down`}
+                            >
+                              ↓
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+
+                <p className="set-eyebrow">{t("Quick actions")}</p>
+                <div className="set-group">
+                  <div className="set-row stack">
+                    <div className="set-label">
+                      <span className="set-name">{t("Web shortcuts")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "One rule per line: prefix = URL with {q}. Type the prefix, a space, and your query — Enter opens the search.",
+                        )}
+                      </span>
+                    </div>
+                    <textarea
+                      className="alias-input"
+                      value={bangsDraft ?? (localStorage.getItem(BANGS_KEY) ?? DEFAULT_BANGS)}
+                      onChange={(e) => setBangsDraft(e.target.value)}
+                      onKeyDown={(e) => e.stopPropagation()}
+                      spellCheck={false}
+                      rows={4}
+                    />
+                    <div className="set-links">
+                      <button
+                        className="link-btn"
+                        onClick={() => {
+                          try {
+                            localStorage.setItem(BANGS_KEY, bangsDraft ?? DEFAULT_BANGS);
+                          } catch {
+                            /* storage unavailable: rules just don't persist */
+                          }
+                          setBangsDraft(null);
+                        }}
+                        disabled={bangsDraft == null}
+                      >
+                        {t("Save shortcuts")}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="set-row stack">
+                    <div className="set-label">
+                      <span className="set-name">{t("Notes file")}</span>
+                      <span className="set-desc">
+                        {t("note buy milk appends one timestamped line to this file.")}{" "}
+                        {t("Currently")} <code>{status?.note_path ?? "notes.md"}</code>
+                      </span>
+                    </div>
+                    <div className="token-row">
+                      <input
+                        className="token-input"
+                        value={notePathDraft}
+                        onChange={(e) => setNotePathDraft(e.target.value)}
+                        onKeyDown={(e) => e.stopPropagation()}
+                        placeholder={t("full path, or empty for the default")}
+                        spellCheck={false}
+                      />
+                      <button className="primary-btn" onClick={() => void applyNotePath()}>
+                        {t("Save")}
+                      </button>
+                      <button
+                        className="ghost-btn"
+                        onClick={() => invoke("open_note_file").catch((e) => setNoteMsg(String(e)))}
+                      >
+                        {t("Open")}
+                      </button>
+                    </div>
+                    {noteMsg && (
+                      <p className={noteMsg === "saved" ? "set-empty" : "error-line"}>{noteMsg === "saved" ? t(noteMsg) : explainErrorRu(noteMsg)}</p>
+                    )}
+                  </div>
+                </div>
+
+                <p className="set-eyebrow">{t("Models & integrations")}</p>
+                <div className="set-group">
+                  <div className="set-row stack">
+                    <div className="set-head">
+                      <div className="set-label">
+                        <span className="set-name">{t("Semantic search")}</span>
+                        <span className="set-desc">
+                          {t(
+                            "Finds things by meaning with a model that runs on this computer (~500 MB download, some memory while running). Off: search matches words; apps and tools work the same.",
+                          )}
+                        </span>
+                      </div>
+                      <div className="pill-row">
+                        {[
+                          { label: "off", on: false },
+                          { label: "on", on: true },
+                        ].map((o) => (
+                          <button
+                            key={o.label}
+                            className={`source ${(status?.semantic === "on") === o.on ? "active" : ""}`}
+                            onClick={async () => {
+                              try {
+                                await invoke("set_semantic", { enabled: o.on });
+                                await refreshStatus();
+                              } catch (e) {
+                                setLastError(String(e));
+                              }
+                            }}
+                          >
+                            {t(o.label)}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    {status?.semantic === "on" && (
+                      <div className="set-links">
+                        <button
+                          className="link-btn"
+                          onClick={async () => {
+                            try {
+                              await invoke("pause_semantic", { pause: !status.semantic_paused });
+                              await refreshStatus();
+                            } catch (e) {
+                              setLastError(String(e));
+                            }
+                          }}
+                        >
+                          {status.semantic_paused
+                            ? t("Resume semantic search")
+                            : t("Pause it to free memory, e.g. for a game")}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="set-row stack">
+                    <div className="set-head">
+                      <div className="set-label">
+                        <span className="set-name">{t("Model download source")}</span>
+                        <span className="set-desc">
+                          {t("Pick the mirror if huggingface.co is unreachable from your network.")}
+                        </span>
+                      </div>
+                      <div className="pill-row">
+                        {HF_ENDPOINTS.map((e) => (
+                          <button
+                            key={e.url}
+                            className={`source ${status?.hf_endpoint === e.url ? "active" : ""}`}
+                            onClick={async () => {
+                              try {
+                                await invoke("set_hf_endpoint", { endpoint: e.url });
+                                await refreshStatus();
+                              } catch (er) {
+                                setLastError(String(er));
+                              }
+                            }}
+                          >
+                            {t(e.label)}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="model-status">
+                      <span>
+                        <span className={`status-dot ${status?.model === "ready" ? "ok" : ""}`} />
+                        {t("Semantic model")} —{" "}
+                        {status?.model === "ready"
+                          ? t("ready")
+                          : status?.model === "loading"
+                            ? "Инициализация модели…"
+                            : status?.model === "loading-local"
+                              ? "Загрузка модели с диска…"
+                            : status?.model === "off"
+                              ? t("off")
+                              : status?.model === "paused"
+                                ? t("paused, memory freed")
+                                : status?.model.startsWith("downloading")
+                                  ? "Скачивание недостающих файлов модели…"
+                                  : modelStatusRu(status?.model)}
+                      </span>
+                      <span>
+                        <span className={`status-dot ${status?.image_model === "ready" ? "ok" : ""}`} />
+                        {t("Image model")} —{" "}
+                        {status?.image_model === "ready"
+                          ? t("ready")
+                          : status?.image_model === "loading"
+                            ? "Инициализация модели…"
+                            : status?.image_model === "loading-local"
+                              ? "Загрузка модели с диска…"
+                            : status?.semantic !== "on"
+                              ? t("off")
+                              : status?.semantic_paused
+                                ? t("paused, memory freed")
+                                : status?.image_model === "idle"
+                                  ? t("not loaded; loads once an image, video or image clip is indexed")
+                                  : status?.image_model.startsWith("downloading")
+                                    ? "Скачивание недостающих файлов модели…"
+                                    : modelStatusRu(status?.image_model)}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="set-row stack">
+                    <div className="set-label">
+                      <span className="set-name">{t("MCP server for AI assistants")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "Lets Claude Code, Cursor and other MCP clients search this index and read indexed text. Loopback only, behind a token, read-only, off by default.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${(status?.mcp_enabled ?? false) === o.on ? "active" : ""}`}
+                          onClick={async () => {
+                            try {
+                              setMcpMsg(null);
+                              await invoke("set_mcp", { enabled: o.on });
+                              // the listener binds in the background; ask twice
+                              await refreshStatus();
+                              setTimeout(() => void refreshStatus(), 600);
+                            } catch (e) {
+                              setMcpMsg(String(e));
+                            }
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                      {status?.mcp_enabled && (
+                        <>
+                          <button
+                            className="ghost-btn"
+                            disabled={!status.mcp_command}
+                            onClick={() => void copyMcpCommand()}
+                          >
+                            {t("Copy Claude Code command")}
+                          </button>
+                          <button className="ghost-btn" onClick={() => void rotateMcpToken()}>
+                            {t("New token")}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                    {status?.mcp_enabled && (
+                      <p className={status.mcp_status.startsWith("failed") ? "error-line" : "set-empty"}>
+                        {status.mcp_status.startsWith("failed") ? (
+                          explainErrorRu(status.mcp_status)
+                        ) : status.mcp_url ? (
+                          <>
+                            {t("Listening at")} <code>{status.mcp_url}</code>
+                          </>
+                        ) : (
+                          t("starting")
+                        )}
+                      </p>
+                    )}
+                    {status?.mcp_enabled && status.mcp_command && (
+                      <p className="set-desc">
+                        {t("Other clients take the same URL with the header from this command:")}
+                        <br />
+                        <code className="mono-wrap">{status.mcp_command}</code>
+                      </p>
+                    )}
+                    {mcpMsg && (
+                      <p className={mcpMsg === "copied" ? "set-empty" : "error-line"}>{mcpMsg === "copied" ? t(mcpMsg) : explainErrorRu(mcpMsg)}</p>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+
+            {settingsTab === "sources" && <IndexSourcesPanel />}
+
+            {settingsTab === "local" && (
+              <>
+                <ModelLibraryPanel />
+                <TestModuleDiagnostics />
+                <p className="set-eyebrow">{t("Folders")}</p>
+                <div className="set-group">
+                  <div className="set-row stack">
+                    <div className="set-head">
+                      <div className="set-label">
+                        <span className="set-name">
+                          {t("Indexed folders")}
+                          {status != null && status.folder_count > 0 && (
+                            <span className="count-pill">{status.folder_count}</span>
+                          )}
+                        </span>
+                        <span className="set-desc">
+                          {t("Scanned recursively; hidden and gitignored paths are skipped.")}
+                        </span>
+                      </div>
+                      <div className="pill-row">
+                        <button className="ghost-btn" onClick={() => void openPlaces()}>
+                          {t("Add common places…")}
+                        </button>
+                        <button className="primary-btn" onClick={addFolder}>
+                          {t("Add folder")}
+                        </button>
+                      </div>
+                    </div>
+                    {placesOpen && (
+                      <div className="places">
+                        <p className="set-desc">
+                          {t("Where downloads, screenshots and files from chat apps usually land. Tick the ones to index.")}
+                        </p>
+                        {places == null ? (
+                          <p className="set-empty">{t("Looking for common places…")}</p>
+                        ) : places.length === 0 ? (
+                          <p className="set-empty">{t("No common places found on this computer.")}</p>
+                        ) : (
+                          places.map((p) => (
+                            <label key={p.path} className={`place-row ${p.state === "new" ? "" : "off"}`}>
+                              <input
+                                type="checkbox"
+                                disabled={p.state !== "new" || placesBusy}
+                                checked={p.state === "added" || p.state === "covered" || placesPick.has(p.path)}
+                                onChange={(e) => {
+                                  const on = e.currentTarget.checked;
+                                  setPlacesPick((s) => {
+                                    const n = new Set(s);
+                                    if (on) n.add(p.path);
+                                    else n.delete(p.path);
+                                    return n;
+                                  });
+                                }}
+                              />
+                              <span className="place-main">
+                                <span className="place-name">{t(PLACE_LABELS[p.kind] ?? p.kind)}</span>
+                                <span className="folder-path" title={p.path}>
+                                  {p.path}
+                                </span>
+                              </span>
+                              <span className="place-note">
+                                {p.state === "new"
+                                  ? tf(p.more ? "{n}+ files" : "{n} files", { n: p.files.toLocaleString() })
+                                  : p.state === "added"
+                                    ? t("Added")
+                                    : p.state === "covered"
+                                      ? t("Already in an indexed folder")
+                                      : t("Holds an indexed folder; remove that one first")}
+                              </span>
+                            </label>
+                          ))
+                        )}
+                        <div className="pill-row places-actions">
+                          <button className="ghost-btn" disabled={placesBusy} onClick={() => setPlacesOpen(false)}>
+                            {t("Cancel")}
+                          </button>
+                          <button
+                            className="primary-btn"
+                            disabled={placesPick.size === 0 || placesBusy}
+                            onClick={() => void addPlaces()}
+                          >
+                            {placesPick.size > 0 ? tf("Add {n}", { n: placesPick.size }) : t("Add")}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {folders.length === 0 &&
+                      // "failed to load" only when the load actually failed. It used
+                      // to be inferred from status.folder_count, which lags behind
+                      // the list after the last folder is removed and showed this
+                      // as an error every time.
+                      (foldersFailed ? (
+                        <p className="error-line">
+                          {t("The folder list failed to load — please report this with the error below.")}
+                        </p>
+                      ) : (
+                        <p className="set-empty">{t("No folders yet.")}</p>
+                      ))}
+                    {folders.length > 0 && (
+                      <div className="folder-list">
+                        {folders.map((f) => (
+                          <div key={f.id} className="folder-row">
+                            <span className="folder-path" title={f.path}>
+                              {f.path}
+                            </span>
+                            <span className="folder-count">{f.file_count}</span>
+                            <button
+                              className="folder-remove"
+                              onClick={() => rebuildFolder(f.id)}
+                              title={t("Rebuild this folder's index from scratch")}
+                              aria-label={`Rebuild index for ${f.path}`}
+                            >
+                              ↻
+                            </button>
+                            <button
+                              className="folder-remove"
+                              onClick={() => removeFolder(f.id)}
+                              title={t("Remove from index")}
+                              aria-label={`Remove ${f.path}`}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="set-row stack">
+                    <div className="set-head">
+                      <div className="set-label">
+                        <span className="set-name">{t("Pinned folders")}</span>
+                        <span className="set-desc">
+                          {tf(
+                            "Up to {n} folders at the top of the empty box, in this order; Enter opens one. They need not be indexed.",
+                            { n: 4 },
+                          )}
+                        </span>
+                      </div>
+                      <button
+                        className="ghost-btn"
+                        disabled={pinnedFolders.length >= 4}
+                        onClick={async () => {
+                          const dir = await holdOpen(() => openDialog({ directory: true, multiple: false }));
+                          if (typeof dir === "string") await savePins([...pinnedFolders, dir]);
+                        }}
+                      >
+                        {t("Pin a folder…")}
+                      </button>
+                    </div>
+                    {pinnedFolders.length > 0 && (
+                      <div className="folder-list">
+                        {pinnedFolders.map((p, i) => (
+                          <div key={p} className="folder-row pin-row">
+                            <span className="folder-path mono-wrap">{p}</span>
+                            <button
+                              className="folder-remove"
+                              title={t("Move up")}
+                              aria-label={t("Move up")}
+                              disabled={i === 0}
+                              onClick={() => {
+                                const v = [...pinnedFolders];
+                                [v[i - 1], v[i]] = [v[i], v[i - 1]];
+                                void savePins(v);
+                              }}
+                            >
+                              ↑
+                            </button>
+                            <button
+                              className="folder-remove"
+                              title={t("Move down")}
+                              aria-label={t("Move down")}
+                              disabled={i === pinnedFolders.length - 1}
+                              onClick={() => {
+                                const v = [...pinnedFolders];
+                                [v[i], v[i + 1]] = [v[i + 1], v[i]];
+                                void savePins(v);
+                              }}
+                            >
+                              ↓
+                            </button>
+                            <button
+                              className="folder-remove"
+                              title={t("Unpin the folder")}
+                              aria-label={t("Unpin the folder")}
+                              onClick={() => void savePins(pinnedFolders.filter((_, j) => j !== i))}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="set-row stack">
+                    <div className="set-head">
+                      <div className="set-label">
+                        <span className="set-name">{t("Editing apps")}</span>
+                        <span className="set-desc">
+                          {tf(
+                            "{key} on a file opens it in the app picked for its type. Other types use the system's own way to edit.",
+                            { key: EDIT_SHORTCUT },
+                          )}
+                        </span>
+                      </div>
+                      <button
+                        className="ghost-btn"
+                        onClick={() => void saveEditRules([...editRules, { exts: [], app: "" }])}
+                      >
+                        {t("Add a type")}
+                      </button>
+                    </div>
+                    {editRules.length > 0 && (
+                      <div className="edit-rules">
+                        {editRules.map((r, i) => (
+                          <div key={i} className="edit-rule-wrap">
+                          <div className="edit-rule">
+                            <input
+                              // re-mounted when the saved value comes back tidied
+                              key={r.exts.join(",")}
+                              className="edit-exts"
+                              defaultValue={r.exts.join(", ")}
+                              placeholder="png, jpg, psd"
+                              aria-label={t("File types")}
+                              spellCheck={false}
+                              onBlur={(e) => {
+                                const v = e.currentTarget.value;
+                                if (v !== r.exts.join(", ")) {
+                                  void saveEditRules(editRules.map((x, j) => (j === i ? { ...x, exts: [v] } : x)));
+                                }
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") e.currentTarget.blur();
+                              }}
+                            />
+                            <select
+                              className="set-select edit-app"
+                              value={r.app}
+                              aria-label={t("Editing app")}
+                              onChange={(e) => {
+                                const app = e.currentTarget.value;
+                                void saveEditRules(editRules.map((x, j) => (j === i ? { ...x, app } : x)));
+                              }}
+                            >
+                              <option value="">{t("System default")}</option>
+                              {r.app && !appChoices.some((a) => a.target === r.app) && (
+                                <option value={r.app}>{t("(not installed)")}</option>
+                              )}
+                              {appChoices.map((a) => (
+                                <option key={a.target} value={a.target}>
+                                  {a.name}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              className="folder-remove"
+                              title={t("Remove")}
+                              aria-label={t("Remove")}
+                              onClick={() => void saveEditRules(editRules.filter((_, j) => j !== i))}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                          {/* a type listed twice opens with one row's app only:
+                              say which, so the row does not look like it works */}
+                          {[...new Set((r.shadowed ?? []).map((s) => s.by))].map((by) => {
+                            // the deciding row always has an app (edit.rs `winner`)
+                            const app =
+                              appChoices.find((a) => a.target === editRules[by]?.app)?.name ?? t("(not installed)");
+                            const exts = (r.shadowed ?? []).filter((s) => s.by === by).map((s) => s.ext);
+                            return (
+                              <div key={by} className="edit-rule-note">
+                                {tf(by < i ? "{exts} already open with {app} above, not here" : "{exts} open with {app} below, not here", {
+                                  exts: exts.join(", "),
+                                  app,
+                                })}
+                              </div>
+                            );
+                          })}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("File changes")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "Changes inside indexed folders reach the index within seconds, without waiting for the next full walk.",
+                        )}
+                        {status?.watch_enabled && status.watch_status === "watching" && (
+                          <>
+                            {" "}
+                            {t("Watching")} {status.watched_folders} {t("folders")}
+                          </>
+                        )}
+                        {status?.watch_enabled && status.watch_status.startsWith("failed") && (
+                          <>
+                            {" "}
+                            <span className="error-line">{explainErrorRu(status.watch_status)}</span>
+                          </>
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${(status?.watch_enabled ?? true) === o.on ? "active" : ""}`}
+                          onClick={async () => {
+                            try {
+                              await invoke("set_watch", { enabled: o.on });
+                              await refreshStatus();
+                            } catch (e) {
+                              setLastError(String(e));
+                            }
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Full rescan")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "Every so often all folders are walked again, so anything the watcher missed still lands. Off leaves it to the watcher and to startup.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[5, 15, 30, 60, 1440]
+                        .map((n) => ({ label: n === 1440 ? "24h" : `${n} ${t("min")}`, minutes: n }))
+                        .concat([{ label: t("off"), minutes: 0 }])
+                        .map((o) => (
+                          <button
+                            key={o.minutes}
+                            className={`source ${(status?.rescan_minutes ?? 1440) === o.minutes ? "active" : ""}`}
+                            onClick={async () => {
+                              try {
+                                await invoke("set_rescan_minutes", { minutes: o.minutes });
+                                await refreshStatus();
+                              } catch (e) {
+                                setLastError(String(e));
+                              }
+                            }}
+                          >
+                            {o.label}
+                          </button>
+                        ))}
+                      <button
+                        className="ghost-btn"
+                        disabled={status?.local_indexing ?? false}
+                        onClick={async () => {
+                          try {
+                            await invoke("index_local");
+                            await refreshStatus();
+                          } catch (e) {
+                            setLastError(String(e));
+                          }
+                        }}
+                      >
+                        {status?.local_indexing ? t("rescanning") : t("Rescan now")}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Max file size")}</span>
+                      <span className="set-desc">
+                        {t("Larger files index by name only. Changing rebuilds.")}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {FILE_CAPS.map((c) => (
+                        <button
+                          key={c.mb}
+                          className={`source ${status?.max_file_mb === c.mb ? "active" : ""}`}
+                          onClick={() => applyFileCap(c.mb)}
+                        >
+                          {t(c.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Skip git worktrees")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "A linked worktree is a second copy of a checkout that is usually indexed already. Skipped when its main checkout is inside an indexed folder; a worktree that is the only copy is still indexed.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${(status?.skip_worktrees ?? true) === o.on ? "active" : ""}`}
+                          onClick={async () => {
+                            try {
+                              await invoke("set_skip_worktrees", { enabled: o.on });
+                              await refreshStatus();
+                            } catch (e) {
+                              setLastError(String(e));
+                            }
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">
+                        {currentLang() === "ru" ? "Индексировать при выключенном экране" : "Index with display off"}
+                      </span>
+                      <span className="set-desc">
+                        {currentLang() === "ru"
+                          ? "Только при питании от сети и пока идёт индексация. Экран может погаснуть; Mac не уйдёт в автоматический сон. Ручной сон и закрытие крышки работают как обычно."
+                          : "Only on AC power while indexing is active. The display may turn off; automatic system sleep is inhibited. Manual sleep and closing the lid still work."}
+                        {status?.sleep_index_active ? (currentLang() === "ru" ? " · Сейчас активно" : " · Active now") : null}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[{ on: false, label: currentLang() === "ru" ? "Выкл" : "Off" },
+                        { on: true, label: currentLang() === "ru" ? "Вкл" : "On" }].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${(status?.sleep_index_enabled ?? false) === o.on ? "active" : ""}`}
+                          onClick={async () => {
+                            try {
+                              await invoke("set_sleep_index", { enabled: o.on });
+                              await refreshStatus();
+                            } catch (e) {
+                              setLastError(String(e));
+                            }
+                          }}
+                        >
+                          {o.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Indexing threads")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "CPU threads each model (text, image, OCR) may use while indexing. Fewer keeps the machine responsive; all cores finishes a first index sooner. Applies right away.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[1, 2, 4, 8]
+                        .filter((n) => n <= (status?.cpu_cores ?? 8))
+                        .map((n) => ({ label: String(n), threads: n }))
+                        .concat([{ label: "all", threads: 0 }])
+                        .map((o) => (
+                          <button
+                            key={o.label}
+                            className={`source ${(status?.index_threads ?? 2) === o.threads ? "active" : ""}`}
+                            onClick={async () => {
+                              try {
+                                await invoke("set_index_threads", { threads: o.threads });
+                                await refreshStatus();
+                              } catch (e) {
+                                setLastError(String(e));
+                              }
+                            }}
+                          >
+                            {o.threads === 0 ? `${t("all cores")} (${status?.cpu_cores ?? "?"})` : o.label}
+                          </button>
+                        ))}
+                    </div>
+                  </div>
+                </div>
+
+                <p className="set-eyebrow">{t("Images, videos & PDFs")}</p>
+                <div className="set-group">
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Image text (OCR)")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "Reads the text inside indexed images and video frames (screenshots, scans, subtitles) so you can search it — video hits jump to the moment the text appears. Off by default; enabling downloads a small model (~15 MB).",
+                        )}
+                        {status?.ocr_enabled && status.ocr_status ? (
+                          <>
+                            {" · "}
+                            {status.ocr_status === "ready" ? t("ready") : status.ocr_status}
+                          </>
+                        ) : null}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      <select
+                        className="set-select"
+                        value={status?.ocr_model ?? "pp-ocr-v4"}
+                        onChange={async (e) => {
+                          try {
+                            // ids/labels mirror core::ocr::OCR_MODELS
+                            await invoke("set_ocr", {
+                              enabled: status?.ocr_enabled ?? false,
+                              model: e.target.value,
+                            });
+                            await refreshStatus();
+                          } catch (err) {
+                            setLastError(String(err));
+                          }
+                        }}
+                        aria-label={t("OCR model")}
+                      >
+                        <option value="pp-ocr-v4">PP-OCRv4 (15 MB)</option>
+                        <option value="pp-ocr-v6-small">PP-OCRv6 small (30 MB)</option>
+                      </select>
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${(status?.ocr_enabled ?? false) === o.on ? "active" : ""}`}
+                          onClick={async () => {
+                            try {
+                              await invoke("set_ocr", {
+                                enabled: o.on,
+                                model: status?.ocr_model ?? "pp-ocr-v4",
+                              });
+                              await refreshStatus();
+                            } catch (e) {
+                              setLastError(String(e));
+                            }
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {status?.ocr_enabled && (
+                    <div className="set-row">
+                      <div className="set-label">
+                        <span className="set-name">{t("Scanned PDFs")}</span>
+                        <span className="set-desc">
+                          {t(
+                            "Also read pages of PDFs that have no text layer. Large scans take a while, so this is your call.",
+                          )}
+                        </span>
+                      </div>
+                      <div className="pill-row">
+                        {[
+                          { label: "off", on: false },
+                          { label: "on", on: true },
+                        ].map((o) => (
+                          <button
+                            key={o.label}
+                            className={`source ${(status?.ocr_pdf ?? false) === o.on ? "active" : ""}`}
+                            onClick={async () => {
+                              try {
+                                await invoke("set_ocr_pdf", { enabled: o.on });
+                                await refreshStatus();
+                              } catch (e) {
+                                setLastError(String(e));
+                              }
+                            }}
+                          >
+                            {t(o.label)}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">
+                        {t("Video shot search")}
+                        {status != null && status.video_shot_count > 0 && (
+                          <span className="count-pill">{status.video_shot_count}</span>
+                        )}
+                      </span>
+                      <span className="set-desc">
+                        {status?.video_note
+                          ? status.video_note
+                          : t(
+                              "Videos in your folders are split into shots; each shot is searchable by image or description. Needs ffmpeg (auto-downloaded if missing).",
+                            )}
+                        {status?.ffmpeg_status ? (
+                          <>
+                            {" · ffmpeg: "}
+                            {status.ffmpeg_status === "system"
+                              ? t("system install")
+                              : status.ffmpeg_status === "bundled"
+                                ? t("downloaded")
+                                : status.ffmpeg_status}
+                          </>
+                        ) : null}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", on: false },
+                        { label: "on", on: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${status?.video_indexing_enabled === o.on ? "active" : ""}`}
+                          onClick={async () => {
+                            try {
+                              await invoke("set_video_indexing", { enabled: o.on });
+                              await refreshStatus();
+                            } catch (e) {
+                              setLastError(String(e));
+                            }
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Decode limits")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "Caps ffmpeg while indexing videos, so it never owns the machine. Hardware decode falls back to software if the driver fails.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "1", threads: 1 },
+                        { label: "2", threads: 2 },
+                        { label: "4", threads: 4 },
+                        { label: "auto", threads: 0 },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${status?.video_decode_threads === o.threads ? "active" : ""}`}
+                          onClick={async () => {
+                            try {
+                              await invoke("set_video_decode", {
+                                threads: o.threads,
+                                hwaccel: status?.video_hwaccel ?? false,
+                              });
+                              await refreshStatus();
+                            } catch (e) {
+                              setLastError(String(e));
+                            }
+                          }}
+                        >
+                          {o.threads === 0 ? t("auto threads") : o.label}
+                        </button>
+                      ))}
+                      <button
+                        className={`source ${status?.video_hwaccel ? "active" : ""}`}
+                        onClick={async () => {
+                          try {
+                            await invoke("set_video_decode", {
+                              threads: status?.video_decode_threads ?? 2,
+                              hwaccel: !(status?.video_hwaccel ?? false),
+                            });
+                            await refreshStatus();
+                          } catch (e) {
+                            setLastError(String(e));
+                          }
+                        }}
+                        title={t("Hardware decode (falls back to software on failure)")}
+                      >
+                        {t("hw decode")}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <p className="set-eyebrow">{t("Apps")}</p>
+                <div className="set-group">
+                  <div className="set-row stack">
+                    <div className="set-head">
+                      <div className="set-label">
+                        <span className="set-name">{t("App folders")}</span>
+                        <span className="set-desc">
+                          {t(
+                            "Apps kept outside the usual places, such as on an external drive. Only the apps in a folder are listed, not the files inside them.",
+                          )}
+                        </span>
+                      </div>
+                      <button className="ghost-btn" onClick={() => void setAppFolder(null, true)}>
+                        {t("Add folder")}
+                      </button>
+                    </div>
+                    {(status?.app_folders ?? []).length > 0 && (
+                      <div className="folder-list">
+                        {(status?.app_folders ?? []).map((p) => (
+                          <div key={p} className="folder-row">
+                            <span className="folder-path" title={p}>
+                              {p}
+                            </span>
+                            <button
+                              className="folder-remove"
+                              onClick={() => void setAppFolder(p, false)}
+                              title={t("Remove")}
+                              aria-label={`Remove ${p}`}
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="set-row stack">
+                    <div className="set-label">
+                      <span className="set-name">{t("App aliases")}</span>
+                      <span className="set-desc">
+                        {t(
+                          "One rule per line: alias = app name. The alias matches like a second name (pinyin included).",
+                        )}
+                      </span>
+                    </div>
+                    <textarea
+                      className="alias-input"
+                      value={aliasDraft ?? status?.app_aliases ?? ""}
+                      onChange={(e) => {
+                        setAliasDraft(e.target.value);
+                        setAliasMsg(null);
+                      }}
+                      onKeyDown={(e) => e.stopPropagation()}
+                      placeholder={"proxy = clash\nbrowser = chrome"}
+                      spellCheck={false}
+                      rows={3}
+                    />
+                    <div className="set-links">
+                      <button
+                        className="link-btn"
+                        onClick={() => saveAliases(aliasDraft ?? status?.app_aliases ?? "")}
+                        disabled={aliasDraft == null}
+                      >
+                        {t("Save aliases")}
+                      </button>
+                      {aliasMsg && (
+                        <span className={aliasMsg === "saved" ? "set-empty" : "error-line"}>
+                          {aliasMsg === "saved" ? t(aliasMsg) : explainErrorRu(aliasMsg)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {settingsTab === "web" && (
+              <>
+                <p className="set-eyebrow">{t("Browsers")}</p>
+                <div className="set-group">
+                  <div className="set-row stack">
+                    <div className="set-head">
+                      <div className="set-label">
+                        <span className="set-name">{t("Browsers found")}</span>
+                        <span className="set-desc">
+                          {t(
+                            "Bookmarks and history are read from every Chromium- and Firefox-based browser on this computer, all profiles. Safari isn't read yet.",
+                          )}
+                        </span>
+                      </div>
+                      <button
+                        className="ghost-btn"
+                        onClick={() => void invoke("sync_bookmarks_now").catch((e) => setLastError(String(e)))}
+                      >
+                        {t("Sync now")}
+                      </button>
+                    </div>
+                    {webSources !== null &&
+                      (webSources.length === 0 ? (
+                        <p className="set-desc">{t("No browser data found yet.")}</p>
+                      ) : (
+                        <div className="browser-list">
+                          {webSources.map((b) => (
+                            <div key={b.browser} className="browser-line">
+                              <BrowserIcons names={[b.browser]} />
+                              <span className="browser-name">{b.browser}</span>
+                              <span className="set-desc">
+                                {tf("{a} bookmarks · {b} history", { a: b.bookmarks, b: b.history })}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              </>
+            )}
+
+            {settingsTab === "stars" && (
+              <>
+                <p className="set-eyebrow">{t("Connection")}</p>
+                <div className="set-group">
+                  <div className="set-row stack">
+                    <div className="set-head">
+                      <div className="set-label">
+                        <span className="set-name">GitHub</span>
+                        <span className="set-desc">
+                          {status?.has_token
+                            ? tokenEditing
+                              ? t("Paste a new token to replace the current one.")
+                              : t("Connected. Your stars sync from this account.")
+                            : t(
+                                "A personal access token, no scopes needed — it only reads your public stars.",
+                              )}
+                        </span>
+                      </div>
+                      {status?.has_token && status.username ? (
+                        <span className="conn-badge ok">
+                          <span className="conn-dot" aria-hidden="true" /> {status.username}
+                        </span>
+                      ) : (
+                        <span className="conn-badge">{t("not connected")}</span>
+                      )}
+                    </div>
+                    {status?.has_token && !tokenEditing && (
+                      <div className="token-row">
+                        <button className="ghost-btn" onClick={() => setTokenEditing(true)}>
+                          {t("Change token")}
+                        </button>
+                        <button
+                          className="danger-btn"
+                          onClick={disconnectGithub}
+                          onBlur={() => setDisconnectArmed(false)}
+                        >
+                          {disconnectArmed ? t("Click again to disconnect") : t("Disconnect")}
+                        </button>
+                      </div>
+                    )}
+                    {status?.has_token && !tokenEditing && disconnectArmed && (
+                      <p className="set-desc">
+                        {t("The token and the star index are removed from this computer. Nothing changes on GitHub.")}
+                      </p>
+                    )}
+                    {(!status?.has_token || tokenEditing) && (
+                    <div className="token-row">
+                      <input
+                        className="token-input"
+                        type="password"
+                        value={tokenInput}
+                        onChange={(e) => setTokenInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.stopPropagation();
+                            submitToken();
+                          }
+                        }}
+                        placeholder="ghp_…"
+                        spellCheck={false}
+                        autoFocus={tokenEditing}
+                      />
+                      <button className="primary-btn" onClick={submitToken} disabled={tokenBusy}>
+                        {tokenBusy ? t("Checking") : t("Connect")}
+                      </button>
+                      {tokenEditing && (
+                        <button
+                          className="ghost-btn"
+                          onClick={() => {
+                            setTokenEditing(false);
+                            setTokenInput("");
+                            setTokenError(null);
+                          }}
+                        >
+                          {t("Cancel")}
+                        </button>
+                      )}
+                    </div>
+                    )}
+                    {tokenError && <p className="error-line">{explainErrorRu(tokenError)}</p>}
+                    <div className="set-links">
+                      <button
+                        className="link-btn"
+                        onClick={() =>
+                          invoke("open_repo", {
+                            url: "https://github.com/settings/tokens/new?description=magpie",
+                          })
+                        }
+                      >
+                        {t("Create one on github.com")}
+                      </button>
+                      {status?.has_token && (
+                        <button
+                          className="link-btn"
+                          onClick={rebuildStars}
+                          title={t("Wipe the star index and sync everything from scratch")}
+                        >
+                          {t("Rebuild star index")}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {settingsTab === "clips" && (
+              <>
+                <p className="set-eyebrow">{t("Privacy")}</p>
+                <div className="set-group">
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">
+                        {t("Clipboard history")}
+                        {status?.clipboard_enabled && (
+                          <span className="count-pill">{status.clip_count}</span>
+                        )}
+                      </span>
+                      <span className="set-desc">
+                        {t(
+                          "Recorded locally, searchable in the Clipboard tab. Password-manager secrets are never stored.",
+                        )}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      {[
+                        { label: "off", enabled: false },
+                        { label: "on", enabled: true },
+                      ].map((o) => (
+                        <button
+                          key={o.label}
+                          className={`source ${status?.clipboard_enabled === o.enabled ? "active" : ""}`}
+                          onClick={async () => {
+                            try {
+                              await invoke("set_clipboard_enabled", { enabled: o.enabled });
+                              await refreshStatus();
+                            } catch (e) {
+                              setLastError(String(e));
+                            }
+                          }}
+                        >
+                          {t(o.label)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {status?.clipboard_enabled && (
+                    <>
+                      <div className="set-row">
+                        <div className="set-label">
+                          <span className="set-name">{t("Keep at most")}</span>
+                        </div>
+                        <div className="pill-row">
+                          {[
+                            { label: "500", entries: 500 },
+                            { label: "2000", entries: 2000 },
+                            { label: "unlimited", entries: 0 },
+                          ].map((o) => (
+                            <button
+                              key={`n${o.entries}`}
+                              className={`source ${status?.clip_max_entries === o.entries ? "active" : ""}`}
+                              onClick={async () => {
+                                try {
+                                  await invoke("set_clip_max_entries", { entries: o.entries });
+                                  await refreshStatus();
+                                } catch (e) {
+                                  setLastError(String(e));
+                                }
+                              }}
+                            >
+                              {t(o.label)}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="set-row">
+                        <div className="set-label">
+                          <span className="set-name">{t("Keep for")}</span>
+                        </div>
+                        <div className="pill-row">
+                          {[
+                            { label: "7 days", days: 7 },
+                            { label: "30 days", days: 30 },
+                            { label: "forever", days: 0 },
+                          ].map((o) => (
+                            <button
+                              key={o.days}
+                              className={`source ${status?.clip_retention_days === o.days ? "active" : ""}`}
+                              onClick={async () => {
+                                try {
+                                  await invoke("set_clip_retention", { days: o.days });
+                                  await refreshStatus();
+                                } catch (e) {
+                                  setLastError(String(e));
+                                }
+                              }}
+                            >
+                              {t(o.label)}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="set-row">
+                        <div className="set-label">
+                          <span className="set-name">{t("Clear history")}</span>
+                          <span className="set-desc">
+                            {t("Delete every recorded clip permanently.")}
+                          </span>
+                        </div>
+                        <button
+                          className="danger-btn"
+                          onClick={async () => {
+                            try {
+                              await invoke("clear_clips_now");
+                              await refreshStatus();
+                            } catch (e) {
+                              setLastError(String(e));
+                            }
+                          }}
+                        >
+                          {t("Clear")}
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+
+            {settingsTab === "about" && (
+              <>
+                <p className="set-eyebrow">{t("System")}</p>
+                <div className="set-group">
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Updates")}</span>
+                      <span className="set-desc">
+                        {updPhase === "available" || updPhase === "downloading"
+                          ? tf("Version {v} is available.", { v: updVersion ?? "" })
+                          : updPhase === "none"
+                            ? t("You are on the latest version.")
+                            : t("Installed in place; your index and settings are kept.")}
+                      </span>
+                    </div>
+                    {updPhase === "available" ? (
+                      <button className="primary-btn" onClick={doInstallUpdate}>
+                        {t("Update & restart")}
+                      </button>
+                    ) : updPhase === "downloading" ? (
+                      <button className="primary-btn" disabled>
+                        {updPct}%
+                      </button>
+                    ) : (
+                      <button
+                        className="ghost-btn"
+                        onClick={() => doCheckUpdate(false)}
+                        disabled={updPhase === "checking"}
+                      >
+                        {updPhase === "checking" ? t("Checking…") : t("Check now")}
+                      </button>
+                    )}
+                  </div>
+                  {updError && <p className="error-line">{explainErrorRu(updError)}</p>}
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Logs")}</span>
+                      <span className="set-desc">
+                        {t("Local activity log (errors, model/ffmpeg status) — attach it to a bug report. Queries are never logged.")}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      <button
+                        className="ghost-btn"
+                        onClick={() => invoke("open_log_dir").catch((e) => setLastError(String(e)))}
+                      >
+                        {t("Open log folder")}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="set-row">
+                    <div className="set-label">
+                      <span className="set-name">{t("Settings file")}</span>
+                      <span className="set-desc">
+                        {t("Everything except the GitHub token — move your setup to another machine.")}
+                      </span>
+                    </div>
+                    <div className="pill-row">
+                      <button
+                        className="ghost-btn"
+                        onClick={async () => {
+                          try {
+                            const path = await holdOpen(() =>
+                              saveDialog({
+                                defaultPath: "magpie-settings.json",
+                                filters: [{ name: "JSON", extensions: ["json"] }],
+                              }),
+                            );
+                            if (!path) return;
+                            const frontend: Record<string, string> = {};
+                            for (const k of LOCAL_KEYS) {
+                              const v = localStorage.getItem(k);
+                              if (v != null) frontend[k] = v;
+                            }
+                            await invoke("export_settings", { path, frontend });
+                            setLastError(null);
+                          } catch (e) {
+                            setLastError(String(e));
+                          }
+                        }}
+                      >
+                        {t("Export")}
+                      </button>
+                      <button
+                        className="ghost-btn"
+                        onClick={async () => {
+                          try {
+                            const path = await holdOpen(() =>
+                              openDialog({
+                                multiple: false,
+                                filters: [{ name: "JSON", extensions: ["json"] }],
+                              }),
+                            );
+                            if (typeof path !== "string") return;
+                            const frontend = await invoke<Record<string, string>>("import_settings", {
+                              path,
+                            });
+                            for (const k of LOCAL_KEYS) {
+                              if (typeof frontend[k] === "string") localStorage.setItem(k, frontend[k]);
+                            }
+                            window.location.reload(); // re-read every store in one clean pass
+                          } catch (e) {
+                            setLastError(String(e));
+                          }
+                        }}
+                      >
+                        {t("Import")}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+
+          </div>
+
+          <TestStatusBar coreModel={status?.model ?? 'idle'} imageModel={status?.image_model ?? 'idle'}
+            onOpenModules={() => setSettingsTab('local')} />
+          {lastError && <p className="error-line" role="alert">{explainErrorRu(lastError)}</p>}
+        </div>
+      ) : emojiHits ? (
+        <div className="emoji-grid">
+          {emojiHits.length === 0 && <span className="emoji-empty">{t("No matching emoji")}</span>}
+          {emojiHits.map((h, i) => (
+            <button
+              key={h.emoji}
+              className={`emoji-cell ${i === 0 ? "first" : ""}`}
+              title={h.name}
+              onClick={() =>
+                void invoke("copy_clip", { text: h.emoji }).then(finishAction)
+              }
+            >
+              {h.emoji}
+            </button>
+          ))}
+        </div>
+      ) : (
+        (results.length > 0 || calcHit != null || bangHit != null || noteHit != null || wsNaming != null || scriptOut != null) && (
+          <>
+          <div
+            className="body-row"
+            // the menu floats over the list; a short list grows to hold it.
+            // So it does for the preview: one result alone left the pane a
+            // few lines tall, its content cut off at the bottom
+            style={userSized
+              ? { flex: "1 1 auto", minHeight: 0, overflow: "hidden" }
+              : {
+                  // The body is the only flexible area at the 620px auto-fit
+                  // ceiling; the footer and query bar must remain visible.
+                  flex: "0 1 auto", minHeight: 0,
+                  ...(actionsOpen || paneLaidOut ? {
+                    minHeight: Math.max(
+                      actionsOpen ? menuActions.length * 34 + 28 : 0,
+                      paneLaidOut ? PREVIEW_MIN_HEIGHT : 0,
+                    ),
+                  } : {}),
+                }
+            }
+          >
+          {actionsOpen && menuActions.length > 0 && (
+            <div className="action-menu" role="menu">
+              {menuActions.map((a, i) => (
+                <div
+                  key={a.key}
+                  role="menuitem"
+                  className={`action-item ${i === actionSel ? "on" : ""} ${a.risky ? "risky" : ""}`}
+                  onMouseMove={() => pointerMovedRef.current && setActionSel(i)}
+                  onMouseDown={(ev) => ev.preventDefault() /* keep focus in the box */}
+                  onClick={() => void runMenuAction(i)}
+                >
+                  <span>
+                    {a.risky && results[selected] && armed === hitKey(results[selected])
+                      ? t("Press Enter again to confirm")
+                      : a.label}
+                  </span>
+                  {i === 0 ? <kbd>⏎</kbd> : a.shortcut ? <kbd>{a.shortcut}</kbd> : null}
+                </div>
+              ))}
+            </div>
+          )}
+          <div
+            className="results"
+            ref={listRef}
+            style={userSized ? {
+              maxHeight: "none", minHeight: 0, height: "auto",
+              flex: "1 1 0", overflowY: "auto",
+            } : { minHeight: 0, overflowY: "auto" }}
+            // any button, the right one too: the focus stays in the box, so the
+            // arrow keys keep moving the selection instead of scrolling (#12)
+            onMouseDown={(e) => e.preventDefault()}
+          >
+            {bangHit && (
+              <div
+                className={`row extra-row ${topRowActive ? "selected" : ""}`}
+                onClick={() =>
+                  void invoke("open_repo", { url: bangHit.url }).then(finishAction)
+                }
+              >
+                <div className="row-main">
+                  <span className="row-title">
+                    {tf("Search {s} for", { s: bangHit.host })} “{bangHit.rest}”
+                  </span>
+                  <span className="row-sub">{bangHit.url}</span>
+                </div>
+                <span className="badge">{t("web")}</span>
+              </div>
+            )}
+            {scriptOut && (
+              <div className="script-out">
+                <div className="script-out-head">
+                  <span className="row-title">📜 {scriptOut.title}</span>
+                  <span className={scriptOut.out.ok ? "row-sub" : "row-sub script-out-bad"}>
+                    {scriptOut.out.ok
+                      ? t("Done")
+                      : scriptOut.out.timed_out
+                        ? t("Stopped after a minute")
+                        : tf("Exited with code {code}", { code: String(scriptOut.out.code ?? "?") })}
+                  </span>
+                </div>
+                <pre className="script-out-text">
+                  {scriptOut.out.stdout.trimEnd() || (scriptOut.out.ok ? t("(no output)") : "")}
+                  {!scriptOut.out.ok && scriptOut.out.stderr.trim() && `\n${scriptOut.out.stderr.trimEnd()}`}
+                </pre>
+                <span className="row-sub">{t("Enter copies the output · Esc closes")}</span>
+              </div>
+            )}
+            {wsNaming && (
+              // the box is asking for a new workspace's name; Enter makes it
+              <div className="row extra-row selected ws-naming" onClick={() => void saveWsName()}>
+                <div className="row-lead">
+                  <span className="app-icon cmd-glyph">🗂️</span>
+                  <div className="row-main">
+                    <span className="row-title">
+                      {query.trim()
+                        ? tf("New workspace “{name}”", { name: query.trim() })
+                        : t("Type a name for the new workspace")}
+                    </span>
+                    <span className="row-sub">
+                      {tf("Enter puts “{title}” in it · Esc cancels", { title: wsNaming.title })}
+                    </span>
+                  </div>
+                </div>
+                <span className="badge">{t("Workspace")}</span>
+              </div>
+            )}
+            {noteHit && (
+              <div
+                className={`row extra-row ${topRowActive ? "selected" : ""}`}
+                onClick={() => void saveNote()}
+              >
+                <div className="row-main">
+                  <span className="row-title">📝 {noteHit.text}</span>
+                  <span className="row-sub">{t("Enter appends this line to your notes file")}</span>
+                </div>
+                <span className="badge">{t("note")}</span>
+              </div>
+            )}
+            {!bangHit && !noteHit && calcHit && (
+              <div
+                className={`row extra-row ${topRowActive ? "selected" : ""}`}
+                onClick={() =>
+                  void takeCalc(calcHit)
+                }
+              >
+                <div className="row-lead">
+                {calcHit.image && (
+                  <img className="calc-image" src={`data:image/png;base64,${calcHit.image}`} alt="" />
+                )}
+                <div className="row-main">
+                  <span className={`row-title calc-value ${calcHit.error ? "calc-error" : ""}`}>
+                    {calcHit.swatch && (
+                      <i className="color-swatch" style={{ background: calcHit.swatch }} />
+                    )}
+                    {calcHit.timer
+                      ? `⏲ ${clock(calcHit.timer)} · ${calcHit.value}`
+                      : calcHit.diff
+                        ? t("Last two copies compared")
+                        : calcHit.swatch || calcHit.error || calcHit.image || calcHit.timerIds || calcHit.action || calcHit.badge || isInfoRow(calcHit)
+                          ? calcHit.value
+                          : // a multi-line result (pretty JSON) previews as one line
+                            `= ${oneLine(calcHit.value)}`}
+                  </span>
+                  {calcHit.diff && (
+                    <pre className="calc-diff">
+                      {calcHit.diff.slice(0, 12).map(([k, line], i) => (
+                        <span key={i} className={k === "+" ? "add" : k === "-" ? "removed" : ""}>
+                          {`${k} ${line}\n`}
+                        </span>
+                      ))}
+                      {calcHit.diff.length > 12 && tf("… {n} more lines", { n: calcHit.diff.length - 12 })}
+                    </pre>
+                  )}
+                  <span className="row-sub">
+                    {calcHit.timer
+                      ? t("Enter starts the timer; a notification comes when it ends")
+                      : calcHit.action
+                        ? `${calcLabel(calcHit.alt)} · ${t(
+                            // a file is only shown in its folder, never opened
+                            calcHit.alt === "show file in folder"
+                              ? "Enter does it"
+                              : (ACTION_HINTS[calcHit.action.split(":")[0]] ?? "Enter does it"),
+                          )}`
+                        : isInfoRow(calcHit)
+                          ? calcLabel(calcHit.alt)
+                          : `${calcLabel(calcHit.alt)}${calcHit.alt && !calcHit.error && !calcHit.timerIds ? " · " : ""}${
+                              calcHit.error || calcHit.timerIds
+                                ? ""
+                                : calcHit.image
+                                  ? t("Enter copies the image")
+                                  : t("Enter copies the result")
+                            }`}
+                  </span>
+                </div>
+                </div>
+                <span className="badge">
+                  {calcHit.badge === "calendar"
+                    ? t("Calendar")
+                    : calcHit.action?.startsWith("open:")
+                    ? t("Path")
+                    : calcHit.action || isInfoRow(calcHit) || (calcHit.error && calcHit.alt === "volume")
+                      ? t("Sound")
+                      : t("calc")}
+                </span>
+              </div>
+            )}
+            {results.map((r, i) => (
+              <div
+                key={hitKey(r)}
+                data-idx={i}
+                className={`row ${i >= selLo && i <= selHi && !(topRowActive && (calcHit || bangHit)) && !wsNaming ? "selected" : ""} ${armed === hitKey(r) ? "armed" : ""}`}
+                onMouseMove={() => {
+                  // hover selects only when the pointer really moved: a
+                  // move event at the same spot (a touchpad twitch, or the
+                  // engine re-sending one after rows changed under a resting
+                  // pointer) used to jump the selection to that row (#7)
+                  if (pointerMovedRef.current && selAnchor == null) setSelected(i);
+                }}
+                onClick={() => openHit(r)}
+              >
+                {r.kind === "command" ? (
+                  <>
+                    <div className="row-lead">
+                      <span className="app-icon cmd-glyph">{COMMAND_GLYPHS[r.id] ?? "⚙️"}</span>
+                      <div className="row-main">
+                        <span className="row-title">{t(COMMAND_LABELS[r.id] ?? r.id)}</span>
+                        <span className="row-sub">
+                          {armed === hitKey(r)
+                            ? t("Press Enter again to confirm")
+                            : r.id.startsWith("settings_")
+                              ? t("System settings")
+                              : t("System command")}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="row-meta">
+                      <span className="app-badge">{t("Command")}</span>
+                    </div>
+                  </>
+                ) : r.kind === "folder" ? (
+                  <>
+                    <div className="row-lead">
+                      <span className="app-icon cmd-glyph">📁</span>
+                      <div className="row-main">
+                        <span className="row-title">{r.name}</span>
+                        <span className="row-sub">{r.path}</span>
+                      </div>
+                    </div>
+                    <div className="row-meta">
+                      <span className="app-badge">{t("Pinned")}</span>
+                    </div>
+                  </>
+                ) : r.kind === "script" ? (
+                  <>
+                    <div className="row-lead">
+                      <span className="app-icon cmd-glyph">{r.icon ?? "📜"}</span>
+                      <div className="row-main">
+                        <span className="row-title">{r.title}</span>
+                        <span className="row-sub">
+                          {armed === hitKey(r)
+                            ? t("Press Enter again to confirm")
+                            : !r.runner
+                              ? t("Nothing on this computer runs this script")
+                              : r.args.length > 0
+                                ? r.args
+                                    .map((a, j) => (r.given[j] ? `${a.placeholder || "…"}: ${r.given[j]}` : `${a.placeholder || "…"}${a.optional ? "?" : ""}`))
+                                    .join(" · ")
+                                : (r.description ?? r.package ?? t("Script command"))}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="row-meta">
+                      {r.keyword && <span className="mono">{r.keyword}</span>}
+                      <span className="app-badge">{t("Script")}</span>
+                    </div>
+                  </>
+                ) : r.kind === "workspace" ? (
+                  <>
+                    <div className="row-lead">
+                      <span className="app-icon cmd-glyph">🗂️</span>
+                      <div className="row-main">
+                        <span className="row-title">{r.name}</span>
+                        <span className="row-sub">
+                          {armed === hitKey(r)
+                            ? t("Press Enter again to confirm")
+                            : `${tf("Opens {n}", { n: r.items.length })} · ${r.items.map((it) => it.title).join(", ")}`}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="row-meta">
+                      <span className="app-badge">{t("Workspace")}</span>
+                    </div>
+                  </>
+                ) : r.kind === "process" ? (
+                  <>
+                    <div className="row-main">
+                      <span className="row-title">{r.name}</span>
+                      <span className="row-sub">
+                        {armed === hitKey(r)
+                          ? t("Press Enter again to end this process")
+                          : `${r.cpu != null ? `CPU ${r.cpu.toFixed(1)}% · ` : ""}${r.listen ? `${r.listen} · ` : ""}PID ${r.pid} · ${formatSize(r.memory)}${
+                              r.group ? ` · ${tf("{n} of them, {size} in all", { n: r.group.count, size: formatSize(r.group.memory) })}` : ""
+                            }${r.exe ? ` · ${r.exe}` : ""}`}
+                      </span>
+                    </div>
+                    <div className="row-meta">
+                      <span className="web-badge">{t("Process")}</span>
+                    </div>
+                  </>
+                ) : r.kind === "clip" && r.clip_kind === "image" ? (
+                  <>
+                    <div className="row-main">
+                      <span className="row-title">{t("Image")}</span>
+                      <span className="row-sub">
+                        {r.width && r.height ? `${r.width} × ${r.height}` : ""}
+                      </span>
+                    </div>
+                    <div className="row-meta">
+                      {relTimeUnix(r.last_copied) && (
+                        <span className="mono">{relTimeUnix(r.last_copied)}</span>
+                      )}
+                      {r.copy_count > 1 && <span>×{r.copy_count}</span>}
+                      {r.thumb && (
+                        <img className="thumb" src={`data:image/jpeg;base64,${r.thumb}`} alt="" />
+                      )}
+                    </div>
+                  </>
+                ) : r.kind === "clip" ? (
+                  <>
+                    <div className="row-main">
+                      <span className="row-title clip-text" title={clipShown(r)}>
+                        {r.pinned && <span className="pin-mark">📌 </span>}
+                        {clipShown(r).split("\n")[0].slice(0, 200)}
+                      </span>
+                      {r.content.includes("\n") && (
+                        <span className="row-sub">
+                          {tf("{n} lines", {
+                            n: r.content.split("\n").filter((l) => l.trim()).length,
+                          })}
+                        </span>
+                      )}
+                    </div>
+                    <div className="row-meta">
+                      {r.masked != null && (
+                        <button
+                          className="reveal-btn"
+                          // keep focus in the input, and don't open the row
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleReveal(r.id);
+                          }}
+                          title={revealed.has(r.id) ? t("Hide the full text") : t("Show the full text")}
+                        >
+                          {revealed.has(r.id) ? t("Hide") : t("Show")}
+                        </button>
+                      )}
+                      {relTimeUnix(r.last_copied) && (
+                        <span className="mono">{relTimeUnix(r.last_copied)}</span>
+                      )}
+                      {r.copy_count > 1 && <span>×{r.copy_count}</span>}
+                    </div>
+                  </>
+                ) : r.kind === "app" ? (
+                  <>
+                    <div className="row-lead">
+                      <AppIcon key={iconEpoch} target={r.target} name={r.name} />
+                      <div className="row-main">
+                        <span className="row-title">{r.name}</span>
+                        <span className="row-sub">{isStoreApp(r.target) ? t("Store app") : t("Application")}</span>
+                      </div>
+                    </div>
+                    <div className="row-meta">
+                      <span className="app-badge">{t("App")}</span>
+                    </div>
+                  </>
+                ) : r.kind === "bookmark" ? (
+                  <>
+                    <div className="row-main">
+                      <span className="row-title">{r.title}</span>
+                      <span className="row-sub">
+                        {r.recall && <span className="recall-tag">{recallText(r.recall, "bookmark")} · </span>}
+                        {r.folder && <span className="dim-prefix">{r.folder} · </span>}
+                        {r.url}
+                      </span>
+                    </div>
+                    <div className="row-meta">
+                      {r.fuzzy && <FuzzyBadge />}
+                      {webScope === "all" && (
+                        <span className="web-badge bookmark">{t("Bookmark")}</span>
+                      )}
+                      {r.added_at != null && relTimeUnix(r.added_at) && (
+                        <span
+                          className="mono"
+                          title={tf("added {d}", {
+                            d: new Date(r.added_at * 1000).toISOString().slice(0, 10),
+                          })}
+                        >
+                          {relTimeUnix(r.added_at)}
+                        </span>
+                      )}
+                      <BrowserIcons names={hitBrowsers(r)} />
+                    </div>
+                  </>
+                ) : r.kind === "history" ? (
+                  <>
+                    <div className="row-main">
+                      <span className="row-title">{r.title || r.url}</span>
+                      <span className="row-sub">{r.url}</span>
+                    </div>
+                    <div className="row-meta">
+                      {r.fuzzy && <FuzzyBadge />}
+                      {webScope === "all" && (
+                        <span className="web-badge history">{t("History")}</span>
+                      )}
+                      {r.last_visit != null && relTimeUnix(r.last_visit) && (
+                        <span className="mono">{relTimeUnix(r.last_visit)}</span>
+                      )}
+                      <span>{r.visit_count}×</span>
+                      <BrowserIcons names={hitBrowsers(r)} />
+                    </div>
+                  </>
+                ) : r.kind === "video" ? (
+                  <>
+                    <div className="row-main">
+                      <span className="row-title">{r.name}</span>
+                      <span className="row-sub">
+                        {/* a shot hit names its time range; a filename hit is whole-file */}
+                        {r.end_ms > r.start_ms && (
+                          <span className="dim-prefix">
+                            {fmtTime(r.start_ms)} – {fmtTime(r.end_ms)} ·{" "}
+                          </span>
+                        )}
+                        {parentDir(r.path)}
+                      </span>
+                    </div>
+                    <div className="row-meta">
+                      <span className="app-badge">{t("Video")}</span>
+                      {r.duration_ms > 0 && <span className="mono">{fmtTime(r.duration_ms)}</span>}
+                      {imageQuery && (
+                        <span className="sim">{Math.max(0, Math.round(r.score * 100))}%</span>
+                      )}
+                      {r.thumb && (
+                        <img className="thumb" src={`data:image/jpeg;base64,${r.thumb}`} alt="" />
+                      )}
+                    </div>
+                  </>
+                ) : r.kind === "repo" ? (
+                  <>
+                    <div className="row-main">
+                      <span className="row-title">
+                        <span className="dim-prefix">{r.full_name.split("/")[0]}/</span>
+                        {r.full_name.split("/")[1]}
+                        {r.archived && <span className="badge">{t("archived")}</span>}
+                      </span>
+                      {(r.description || r.recall) && (
+                        <span className="row-sub">
+                          {r.recall && (
+                            <span className="recall-tag">
+                              {recallText(r.recall, "repo")}
+                              {r.description ? " · " : ""}
+                            </span>
+                          )}
+                          {r.description}
+                        </span>
+                      )}
+                    </div>
+                    <div className="row-meta">
+                      {relTime(r.pushed_at) && (
+                        <span
+                          className="mono"
+                          title={tf("last push {d}", { d: r.pushed_at?.slice(0, 10) ?? "" })}
+                        >
+                          {relTime(r.pushed_at)}
+                        </span>
+                      )}
+                      {r.language && <span>{r.language}</span>}
+                      <span className="stars">★ {formatStars(r.stars)}</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="row-main">
+                      <span className="row-title">{r.name}</span>
+                      <span className="row-sub">
+                        {r.snippet ? renderSnippet(r.snippet) : parentDir(r.path)}
+                      </span>
+                    </div>
+                    <div className="row-meta">
+                      {relTimeUnix(r.mtime) && (
+                        <span
+                          className="mono"
+                          title={tf("modified {d}", {
+                            d: new Date(r.mtime * 1000).toISOString().slice(0, 10),
+                          })}
+                        >
+                          {relTimeUnix(r.mtime)}
+                        </span>
+                      )}
+                      {r.match_kind && !imageQuery && (
+                        <span title="Источник поискового совпадения; не оценка достоверности">
+                          {r.match_kind}
+                        </span>
+                      )}
+                      {r.ext && <span>{r.ext}</span>}
+                      <span className="mono">{formatSize(r.size)}</span>
+                      {imageQuery && (
+                        <span className="sim">
+                          {Math.max(0, Math.round(r.score * 100))}%
+                        </span>
+                      )}
+                      {r.thumb && (
+                        <img
+                          className="thumb"
+                          src={`data:image/jpeg;base64,${r.thumb}`}
+                          alt=""
+                        />
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+          </div>
+          {/* outside .body-row, which is the action menu's positioning box:
+              the pane sits in the panel's right padding, full height, not
+              over the list (#11) */}
+          {paneLaidOut && (
+            <PreviewPane
+              hit={results[selected]}
+              data={preview}
+              query={query}
+              clipShown={clipShown}
+              revealed={revealed}
+              onReveal={toggleReveal}
+              origin={origin}
+              webInfo={webInfo}
+              onOpenPage={(url) => {
+                invoke("open_repo", { url })
+                  .then(() => finishAction())
+                  .catch((e) => setLastError(String(e)));
+              }}
+            />
+          )}
+          </>
+        )
+      )}
+
+      {!needsToken && !showSettings && results.length === 0 && query.trim() !== "" && !noteHit && !wsNaming && !scriptOut && (
+        <div className="empty">
+          {source === "github-stars"
+            ? t("No matches in your stars")
+            : source === "web"
+              ? t("No matching bookmarks or history")
+              : source === "clips"
+                ? t("No matching clips")
+                : t("No matches in indexed folders")}
+        </div>
+      )}
+
+      {needsAccess && !showSettings && (
+        <div className="access-row">
+          <span className="access-text">
+            {t("Selection search needs Accessibility: allow magpie in System Settings → Privacy & Security → Accessibility")}
+          </span>
+          <button
+            className="ghost-btn"
+            tabIndex={-1}
+            onClick={() => invoke("open_accessibility_settings").catch((e) => setLastError(String(e)))}
+          >
+            {t("Open System Settings")}
+          </button>
+          <button className="access-close" tabIndex={-1} title={t("Dismiss")} onClick={() => setNeedsAccess(false)}>
+            ×
+          </button>
+        </div>
+      )}
+
+      {indexExplorerOpen && !showSettings && <div className="ux-overlay" role="dialog" aria-modal="true" aria-label="Папки и хранилища"
+          onKeyDown={e => { e.stopPropagation(); if (e.key === 'Escape') setIndexExplorerOpen(false); }}>
+        <div className="ux-overlay-head"><h2>Папки и хранилища</h2>
+          <button className="ghost-btn" onClick={() => setIndexExplorerOpen(false)}>Назад к поиску</button></div>
+        <div className="ux-overlay-scroll"><IndexSourcesPanel /></div>
+      </div>}
+      {searchHistoryOpen && !showSettings && <div className="ux-overlay" role="dialog" aria-modal="true" aria-label="История поиска"
+          onKeyDown={e => { e.stopPropagation(); if (e.key === 'Escape') setSearchHistoryOpen(false); }}>
+        <div className="ux-overlay-head"><h2>История поиска</h2>
+          <button className="ghost-btn" onClick={() => setSearchHistoryOpen(false)}>Назад к поиску</button></div>
+        <div className="ux-overlay-scroll"><SearchHistoryPanel refreshToken={searchHistoryRevision}
+          onSearch={(q,src) => {
+            const idx = sourcesRef.current.findIndex(s => s.id === src);
+            if (idx >= 0) switchSource(idx);
+            setQuery(q); setSearchHistoryOpen(false); inputRef.current?.focus();
+          }} /></div>
+      </div>}
+      {/* footer */}
+      <div className="footer">
+        <span className="hints">
+          {/* ↑↓ needs no hint. The 1–9 jump chord is not listed either: each
+              tab's tooltip names it, and so does a launch tip. */}
+          {footerHints
+            .filter((h) => !droppedHints.has(h.key))
+            .map((h) => (
+              <span key={h.key}>{h.node}</span>
+            ))}
+        </span>
+        {source === "local" && (
+          <button type="button" className="ux-nav-button" title="Просмотреть дерево проиндексированных папок"
+            onClick={() => setIndexExplorerOpen(true)}>Папки</button>
+        )}
+        <button type="button" className="ux-nav-button" title="История поисковых запросов на этом Mac"
+          onClick={() => setSearchHistoryOpen(true)}>История</button>
+        <span className="status" ref={footerStatusRef}>
+          {footerStatus}
+        </span>
+        <button
+          type="button"
+          title={userSized ? "Сбросить размер окна" : "Развернуть результаты поиска"}
+          aria-label={userSized ? "Сбросить размер окна" : "Развернуть результаты поиска"}
+          tabIndex={-1}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={userSized ? resetUserResize : expandUserResize}
+          style={{ marginLeft: 4, border: 0, background: "transparent", color: "inherit", cursor: "pointer", fontSize: 14 }}
+        >{userSized ? "Сбросить размер" : "Развернуть"}</button>
+      </div>
+      {!showSettings && (
+        <TestStatusBar coreModel={status?.model ?? 'idle'} imageModel={status?.image_model ?? 'idle'}
+          onOpenModules={() => { setShowSettings(true); setSettingsTab('local'); }} />
+      )}
+      <button
+        type="button"
+        title="Потяните за угол, чтобы увеличить окно"
+        aria-label="Изменить размер окна"
+        tabIndex={-1}
+        onPointerDown={(e) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+          e.currentTarget.setPointerCapture(e.pointerId);
+          beginUserResize(e.screenX, e.screenY);
+        }}
+        onPointerMove={(e) => {
+          if (resizeGestureRef.current) moveUserResize(e.screenX, e.screenY);
+        }}
+        onPointerUp={(e) => {
+          if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          }
+          endUserResize();
+        }}
+        onPointerCancel={endUserResize}
+        style={{
+          position: "absolute", right: 0, bottom: 0, zIndex: 30,
+          width: 18, height: 18, padding: 0, border: 0,
+          background: "transparent", color: "var(--text-faint)",
+          fontSize: 15, lineHeight: "18px", textAlign: "center",
+          cursor: "nwse-resize", opacity: 0.65,
+        }}
+      >◢</button>
+    </div>
+  );
+}
+
+/// Turn a keydown inside a shortcut recorder into a chord string.
+/// Modifier-only presses are ignored; a bare Backspace/Delete/Escape clears.
+/// Shift-only or bare chords (Shift+A, Tab…) would hijack normal typing
+/// system-wide, so anything that is not an F-key needs Ctrl/Alt/Super.
+const DESKTOP_NAMES: Record<string, string> = {
+  sway: "sway",
+  hyprland: "Hyprland",
+  niri: "niri",
+  gnome: "GNOME",
+  kde: "KDE",
+  other: "",
+};
+
+/// The summon key on a Wayland desktop (#15): bound by magpie through the
+/// desktop's IPC, or the command (niri: the config lines) to bind by hand.
+function WaylandHotkey({ info }: { info: WaylandHotkeyInfo }) {
+  const [copied, setCopied] = useState(false);
+  const desktop = DESKTOP_NAMES[info.desktop] ?? "";
+  if (info.registered) {
+    return (
+      <p className="set-empty">
+        {tf("On Wayland, magpie bound {key} through {desktop}.", { key: info.hotkey, desktop })}
+      </p>
+    );
+  }
+  const text = info.snippet ?? info.command;
+  const lead = info.snippet
+    ? t("niri takes no bindings at run time. Add these lines to ~/.config/niri/config.kdl:")
+    : info.error
+      ? tf("Binding the key through {desktop} failed ({error}). Bind a key to this command by hand:", {
+          desktop,
+          error: info.error,
+        })
+      : t("On Wayland the desktop owns the keyboard: in its keyboard settings, add a custom shortcut that runs this command.");
+  return (
+    <div className="wayland-hotkey">
+      <span className="set-desc">{lead}</span>
+      <pre className="wayland-cmd">{text}</pre>
+      <button
+        className="ghost-btn"
+        onClick={() =>
+          void invoke("copy_clip", { text }).then(() => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          })
+        }
+      >
+        {copied ? t("Copied") : t("Copy")}
+      </button>
+    </div>
+  );
+}
+
+function chordFromEvent(e: React.KeyboardEvent): {
+  chord?: string;
+  clear?: boolean;
+  ignore?: boolean;
+  error?: string;
+} {
+  e.preventDefault();
+  e.stopPropagation();
+  if (["Control", "Alt", "Shift", "Meta"].includes(e.key)) return { ignore: true };
+  if (!e.ctrlKey && !e.altKey && !e.metaKey && ["Backspace", "Delete", "Escape"].includes(e.key)) {
+    return { clear: true };
+  }
+  const parts: string[] = [];
+  if (e.ctrlKey) parts.push("Ctrl");
+  if (e.altKey) parts.push("Alt");
+  if (e.shiftKey) parts.push("Shift");
+  if (e.metaKey) parts.push("Super");
+  let key = e.key.length === 1 ? e.key.toUpperCase() : e.key;
+  if (e.key === " ") key = "Space";
+  const strongModifier = e.ctrlKey || e.altKey || e.metaKey;
+  if (!strongModifier && !/^F([1-9]|1[0-9]|2[0-4])$/.test(key)) {
+    return { error: "use Ctrl/Alt/Win plus a key, or an F-key" };
+  }
+  parts.push(key);
+  return { chord: parts.join("+") };
+}
+
+/// One-line rendering of a possibly multi-line value (pretty JSON, sorted
+/// lines): the first line, clipped, plus a line count. Enter still copies
+/// the whole thing.
+/// A result as one line for the top row: whitespace runs collapsed (so
+/// pretty JSON reads `{ "a": 1, … }` instead of a lone `{`), cut at 160
+/// chars, and a line count when it had several.
+function oneLine(value: string): string {
+  const lines = value.split("\n").length;
+  const flat = value.replace(/\s+/g, " ").trim();
+  const head = flat.length > 160 ? `${flat.slice(0, 160)}…` : flat;
+  return lines > 1 ? `${head}  (${lines} lines)` : head;
+}
+
+/// Highlight every occurrence of the query's words in a text run.
+function highlightQuery(text: string, query: string): React.ReactNode[] {
+  const words = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length >= 2);
+  if (words.length === 0) return [text];
+  const out: React.ReactNode[] = [];
+  const lower = text.toLowerCase();
+  let pos = 0;
+  let key = 0;
+  while (pos < text.length) {
+    let best = -1;
+    let bestLen = 0;
+    for (const w of words) {
+      const i = lower.indexOf(w, pos);
+      if (i >= 0 && (best === -1 || i < best)) {
+        best = i;
+        bestLen = w.length;
+      }
+    }
+    if (best === -1) {
+      out.push(text.slice(pos));
+      break;
+    }
+    if (best > pos) out.push(text.slice(pos, best));
+    out.push(<mark key={key++}>{text.slice(best, best + bestLen)}</mark>);
+    pos = best + bestLen;
+  }
+  return out;
+}
+
+/// Right-hand preview of the selected hit. Web/clip/app hits carry all their
+/// data already; file/video/repo previews arrive via get_preview.
+/// App icons by launch target, for the whole session: the backend caches
+/// too, this just saves the round trip on every re-render and keystroke.
+const appIconCache = new Map<string, string | null>();
+
+/// First start (#8): three short pages, then the one real question, whether
+/// to download the semantic model. Enter moves on, Esc hides the window
+/// (the welcome comes back next time until it is answered).
+function Welcome({
+  panelRef,
+  hotkey,
+  onChoose,
+}: {
+  panelRef: React.RefObject<HTMLDivElement | null>;
+  hotkey: string;
+  onChoose: (on: boolean) => Promise<void>;
+}) {
+  const [step, setStep] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const last = 2;
+  const choose = async (on: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    await onChoose(on);
+    setBusy(false);
+  };
+  useEffect(() => {
+    panelRef.current?.focus();
+  }, [panelRef, step]);
+  return (
+    <div
+      className="panel welcome"
+      ref={panelRef}
+      tabIndex={-1}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          void invoke("dismiss");
+        } else if (e.key === "Enter" && step < last) {
+          e.preventDefault();
+          setStep(step + 1);
+        } else if (e.key === "ArrowLeft" && step > 0) {
+          setStep(step - 1);
+        } else if (e.key === "ArrowRight" && step < last) {
+          setStep(step + 1);
+        }
+      }}
+    >
+      <div className="welcome-body" data-tauri-drag-region>
+        {step === 0 && (
+          <>
+            <p className="welcome-title">{t("Welcome to magpie")}</p>
+            <p className="welcome-text">
+              {t("One search box for your apps, files, bookmarks, starred repos and clipboard. Everything stays on this computer.")}
+            </p>
+            <p className="welcome-text">
+              {t("Open it from anywhere with")} <kbd>{hotkey}</kbd>
+              {t(", type, and press Enter.")}
+            </p>
+          </>
+        )}
+        {step === 1 && (
+          <>
+            <p className="welcome-title">{t("What it finds")}</p>
+            <ul className="welcome-list">
+              <li>{t("Apps by name or abbreviation: for example, VS Code")}</li>
+              <li>{t("Files in the folders you add in settings, text and images alike")}</li>
+              <li>{t("Bookmarks and history from your browsers")}</li>
+              <li>{t("Your starred GitHub repos, once you connect")}</li>
+              <li>{t("What you copy, if you turn the clipboard history on")}</li>
+            </ul>
+            <p className="welcome-text">
+              <kbd>tab</kbd> {t("switches between them. The box is also a calculator, a unit converter and more; the tips below it show how.")}
+            </p>
+          </>
+        )}
+        {step === 2 && (
+          <>
+            <p className="welcome-title">{t("Search by meaning?")}</p>
+            <p className="welcome-text">
+              {t("With semantic search, “unpaid bill from the plumber” finds the plumbing invoice even when no word matches. It runs a model on this computer: about 500 MB to download once, and some memory while magpie runs.")}
+            </p>
+            <p className="welcome-text">
+              {t("Without it, search matches words, and apps, tools and everything else work the same. You can change this any time in Settings → General.")}
+            </p>
+            <div className="welcome-choice">
+              <button className="primary-btn" disabled={busy} onClick={() => void choose(true)}>
+                {t("Turn it on (downloads ~500 MB)")}
+              </button>
+              <button className="ghost-btn" disabled={busy} onClick={() => void choose(false)}>
+                {t("Not now")}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+      <div className="welcome-foot">
+        <span className="welcome-dots">
+          {[0, 1, 2].map((i) => (
+            <i key={i} className={i === step ? "on" : ""} />
+          ))}
+        </span>
+        <span className="welcome-nav">
+          {step > 0 && (
+            <button className="link-btn" onClick={() => setStep(step - 1)}>
+              {t("Back")}
+            </button>
+          )}
+          {step < last && (
+            <button className="primary-btn" onClick={() => setStep(step + 1)}>
+              {t("Next")}
+            </button>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/// A key combination, modifier and key apart so "⌘K" does not read as one
+/// glyph and "Ctrl" does not run into its key (#5).
+function Keys({ keys }: { keys: string[] }) {
+  return (
+    <kbd className="keys">
+      {keys.map((k, i) => (
+        <span key={i}>{k}</span>
+      ))}
+    </kbd>
+  );
+}
+
+let canvasForMeasuring: HTMLCanvasElement | null = null;
+function measureCanvas(): HTMLCanvasElement {
+  canvasForMeasuring ??= document.createElement("canvas");
+  return canvasForMeasuring;
+}
+
+/// The browsers a web hit is in: all of them when the search collapsed one
+/// URL kept in several, else the one it came from.
+function hitBrowsers(h: BookmarkHit | HistoryHit): string[] {
+  return h.browsers && h.browsers.length > 0 ? h.browsers : [h.browser];
+}
+
+function FuzzyBadge() {
+  return (
+    <span className="web-badge fuzzy" title={t("Found by meaning; no word in common with what you typed")}>
+      {t("Maybe related")}
+    </span>
+  );
+}
+
+const browserIconCache = new Map<string, string | null>();
+const browserIconLoads = new Map<string, Promise<string | null>>();
+
+/// One request per browser name, shared: a row that mounts while it is in
+/// flight (or remounts, as React's strict mode does) waits on the same one.
+function loadBrowserIcon(name: string): Promise<string | null> {
+  let p = browserIconLoads.get(name);
+  if (!p) {
+    p = invoke<string | null>("browser_icon", { browser: name })
+      .then((src) => src ?? null)
+      .catch(() => null)
+      .then((src) => {
+        browserIconCache.set(name, src);
+        return src;
+      });
+    browserIconLoads.set(name, p);
+  }
+  return p;
+}
+
+/// Small, half-grey icons of the browsers a web hit is in, so a bookmark
+/// kept in three browsers shows three. A browser that is not installed as
+/// an app (or has no icon) shows its first letter.
+function BrowserIcons({ names }: { names: string[] }) {
+  const [, setTick] = useState(0);
+  const key = names.join("\u0000");
+  useEffect(() => {
+    let live = true;
+    for (const n of key.split("\u0000")) {
+      if (browserIconCache.has(n)) continue;
+      void loadBrowserIcon(n).then((src) => {
+        if (live && src) setTick((x) => x + 1);
+      });
+    }
+    return () => {
+      live = false;
+    };
+  }, [key]);
+  return (
+    <span className="browser-icons">
+      {names.map((n) => {
+        const src = browserIconCache.get(n);
+        return src ? (
+          <img key={n} className="browser-icon" src={src} alt={n} title={n} />
+        ) : (
+          <span key={n} className="browser-icon browser-mono" title={n}>
+            {[...n][0]?.toUpperCase() ?? "?"}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+/// Every icon the backend already holds, into the palette's cache, so an app
+/// row paints with its icon in its first frame instead of flashing the
+/// monogram while it asks. Once at start and after `app-icons-changed`, when
+/// the new set replaces the old one in a single step: clearing first left a
+/// gap in which rows rendered with the monogram though every icon was known.
+function loadAppIcons(replace = false): Promise<void> {
+  return invoke<Record<string, string | null>>("cached_app_icons")
+    .then((m) => {
+      if (replace) {
+        for (const target of [...appIconCache.keys()]) if (!(target in m)) appIconCache.delete(target);
+      }
+      for (const [target, url] of Object.entries(m)) appIconCache.set(target, url);
+    })
+    .catch(() => {});
+}
+
+/// The OS icon for an app row. Until it arrives (or when there is none) the
+/// name's first letter, in a box of the same size, holds its place, so rows
+/// never shift.
+function AppIcon({ target, name }: { target: string; name: string }) {
+  const [src, setSrc] = useState<string | null | undefined>(() => appIconCache.get(target));
+  useEffect(() => {
+    if (appIconCache.has(target)) {
+      setSrc(appIconCache.get(target));
+      return;
+    }
+    let live = true;
+    invoke<string | null>("app_icon", { target })
+      .then((url) => {
+        appIconCache.set(target, url ?? null);
+        if (live) setSrc(url ?? null);
+      })
+      .catch(() => {
+        if (live) setSrc(null);
+      });
+    return () => {
+      live = false;
+    };
+  }, [target]);
+  if (src) return <img className="app-icon" src={src} alt="" />;
+  const first = [...name.trim()][0]?.toUpperCase() ?? "?";
+  return <span className="app-icon app-monogram">{first}</span>;
+}
+
+function PreviewPane({
+  hit,
+  data,
+  query,
+  clipShown,
+  revealed,
+  onReveal,
+  origin,
+  webInfo,
+  onOpenPage,
+}: {
+  hit: Hit | undefined;
+  data: Record<string, unknown> | null;
+  query: string;
+  clipShown: (c: ClipHit) => string;
+  revealed: ReadonlySet<number>;
+  onReveal: (id: number) => void;
+  origin: FileOrigin | null;
+  webInfo: WebInfo | null;
+  onOpenPage: (url: string) => void;
+}) {
+  if (!hit) return <div className="preview-pane" />;
+  return (
+    <div className="preview-pane">
+      {origin && (hit.kind === "file" || hit.kind === "video") && (
+        <p className="pv-meta pv-origin">
+          {t("Downloaded from")}{" "}
+          {origin.page ? (
+            <button
+              className="link-btn"
+              title={origin.page}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => onOpenPage(origin.page as string)}
+            >
+              {origin.host}
+            </button>
+          ) : (
+            origin.host
+          )}
+        </p>
+      )}
+      {hit.kind === "clip" && hit.clip_kind === "image" ? (
+        <>
+          {data?.kind === "image" && typeof data.image === "string" ? (
+            <img className="pv-image" src={`data:image/jpeg;base64,${data.image}`} alt="" />
+          ) : hit.thumb ? (
+            <img className="pv-image" src={`data:image/jpeg;base64,${hit.thumb}`} alt="" />
+          ) : null}
+          <p className="pv-meta">
+            {hit.width} × {hit.height} · {relTimeUnix(hit.last_copied)} · ×{hit.copy_count}
+          </p>
+        </>
+      ) : hit.kind === "clip" ? (
+        <>
+          <p className="pv-title">{t("Clipboard entry")}</p>
+          <pre className="pv-text">{clipShown(hit)}</pre>
+          <p className="pv-meta">
+            {relTimeUnix(hit.last_copied)} · ×{hit.copy_count}
+            {hit.masked != null && (
+              <>
+                {" · "}
+                <button
+                  className="link-btn"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => onReveal(hit.id)}
+                >
+                  {revealed.has(hit.id) ? t("Hide the full text") : t("Show the full text")}
+                </button>
+              </>
+            )}
+          </p>
+        </>
+      ) : hit.kind === "bookmark" || hit.kind === "history" ? (
+        <>
+          <p className="pv-title">{hit.title || hit.url}</p>
+          {webInfo?.host && <p className="pv-host">{webInfo.host}</p>}
+          <p className="pv-link">{hit.url}</p>
+          {webInfo?.description && <p className="pv-desc">{webInfo.description}</p>}
+          {webInfo ? (
+            <div className="pv-facts">
+              {webInfo.bookmarks.map((b, i) => (
+                <p key={i} className="pv-meta">
+                  {tf("Bookmarked in {where}", { where: [b.browser, b.folder].filter(Boolean).join(" › ") })}
+                  {b.added_at != null && ` · ${new Date(b.added_at * 1000).toISOString().slice(0, 10)}`}
+                </p>
+              ))}
+              {webInfo.visits > 0 && (
+                <p className="pv-meta">
+                  {tf("Visited {n} times", { n: webInfo.visits })}
+                  {webInfo.first_visit != null &&
+                    ` · ${tf("earliest on record {d}", { d: new Date(webInfo.first_visit * 1000).toISOString().slice(0, 10) })}`}
+                  {webInfo.last_visit != null &&
+                    ` · ${tf("latest {d}", { d: new Date(webInfo.last_visit * 1000).toISOString().slice(0, 10) })}`}
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="pv-meta">
+              {hit.kind === "bookmark"
+                ? `${t("Bookmark")} · ${hit.folder || "—"} · ${hitBrowsers(hit).join(", ")}`
+                : `${t("History")} · ${hit.visit_count}× · ${hitBrowsers(hit).join(", ")}`}
+            </p>
+          )}
+        </>
+      ) : hit.kind === "app" ? (
+        <>
+          <p className="pv-title">{hit.name}</p>
+          <p className="pv-meta mono-wrap">{hit.target}</p>
+        </>
+      ) : hit.kind === "folder" ? (
+        <>
+          <p className="pv-title">{hit.name}</p>
+          <p className="pv-meta mono-wrap">{hit.path}</p>
+        </>
+      ) : hit.kind === "workspace" ? (
+        <>
+          <p className="pv-title">{hit.name}</p>
+          <p className="pv-meta">{tf("Opens {n}", { n: hit.items.length })}</p>
+          <ul className="pv-ws">
+            {hit.items.map((it) => (
+              <li key={`${it.kind}-${it.target}`}>
+                <span className="pv-ws-title">{it.title}</span>
+                <span className="pv-meta pv-ws-target" title={it.target}>
+                  {it.target}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : hit.kind === "repo" && data?.kind === "repo" ? (
+        <>
+          {typeof data.description === "string" && data.description && (
+            <p className="pv-desc">{data.description}</p>
+          )}
+          {typeof data.topics === "string" && data.topics !== "[]" && (
+            <p className="pv-chips">
+              {(JSON.parse(data.topics as string) as string[]).slice(0, 8).map((tp) => (
+                <span key={tp} className="pv-chip">
+                  {tp}
+                </span>
+              ))}
+            </p>
+          )}
+          {typeof data.readme === "string" && data.readme && (
+            <pre className="pv-text">
+              {data.readme}
+              {data.readme_clipped ? " …" : ""}
+            </pre>
+          )}
+        </>
+      ) : hit.kind === "file" && data?.kind === "image" && typeof data.image === "string" ? (
+        <img className="pv-image" src={`data:image/jpeg;base64,${data.image}`} alt="" />
+      ) : hit.kind === "file" && data?.kind === "text" && typeof data.text === "string" ? (
+        <pre className="pv-text">
+          {data.clipped_head ? "… " : ""}
+          {highlightQuery(data.text, query)}
+          {data.clipped_tail ? " …" : ""}
+        </pre>
+      ) : hit.kind === "file" && data?.kind === "archive" && typeof data.text === "string" ? (
+        // a zip: what it holds, the name that matched in view
+        <>
+          <p className="pv-meta">
+            {tf("Files inside: {n}", { n: Number(data.files) })}
+            {data.encrypted ? ` · ${t("password-protected, names only")}` : ""}
+          </p>
+          <pre className="pv-text">
+            {data.clipped_head ? "…\n" : ""}
+            {highlightQuery(data.text, query)}
+            {data.clipped_tail ? "\n…" : ""}
+          </pre>
+        </>
+      ) : hit.kind === "video" && data?.kind === "image" && typeof data.image === "string" ? (
+        // a video the index has not cut into shots yet: one frame of it
+        <img className="pv-image" src={`data:image/jpeg;base64,${data.image}`} alt="" />
+      ) : (hit.kind === "video" || hit.kind === "file") &&
+        data?.kind === "shots" &&
+        Array.isArray(data.shots) &&
+        data.shots.length > 0 ? (
+        <>
+          <p className="pv-title">{t("Shots")}</p>
+          <div className="pv-shots">
+            {(data.shots as { start_ms: number; end_ms: number; ts_ms: number; thumb: string | null }[]).map(
+              (s) => (
+                <div
+                  key={s.ts_ms}
+                  className={`pv-shot ${hit.kind === "video" && hit.ts_ms === s.ts_ms ? "on" : ""}`}
+                >
+                  {s.thumb ? (
+                    <img src={`data:image/jpeg;base64,${s.thumb}`} alt="" />
+                  ) : (
+                    <span className="pv-shot-empty" />
+                  )}
+                  <span className="pv-shot-t">{fmtTime(s.start_ms)}</span>
+                </div>
+              ),
+            )}
+          </div>
+        </>
+      ) : data == null ? (
+        // still loading (a local file waits for the selection to rest): the
+        // index's thumbnail stands in, so the pane is not blank meanwhile
+        (hit.kind === "file" || hit.kind === "video") && hit.thumb ? (
+          <img className="pv-image pv-placeholder" src={`data:image/jpeg;base64,${hit.thumb}`} alt="" />
+        ) : null
+      ) : hit.kind === "file" || hit.kind === "video" ? (
+        // nothing to render inline (a binary, an empty file, a video with
+        // no ffmpeg at hand): the facts about the file instead of a blank
+        <>
+          <p className="pv-title">{hit.name}</p>
+          <p className="pv-meta mono-wrap">{parentDir(hit.path)}</p>
+          <p className="pv-meta">
+            {hit.kind === "file"
+              ? [formatSize(hit.size), relTimeUnix(hit.mtime)].filter(Boolean).join(" · ")
+              : hit.duration_ms > 0
+                ? fmtTime(hit.duration_ms)
+                : t("Video")}
+          </p>
+        </>
+      ) : (
+        <p className="pv-meta">{t("No preview")}</p>
+      )}
+    </div>
+  );
+}
+
+// localsearch.china_features.removed.v1 — Chinese-specific options removed from user-facing UI.

@@ -1,0 +1,1035 @@
+//! SQLite storage: repos, FTS5 index, embeddings, metadata.
+
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Repo {
+    pub id: i64,
+    pub full_name: String,
+    pub description: Option<String>,
+    pub language: Option<String>,
+    pub topics: Vec<String>,
+    pub stars: i64,
+    pub html_url: String,
+    pub homepage: Option<String>,
+    pub archived: bool,
+    pub fork: bool,
+    pub starred_at: Option<String>,
+    pub pushed_at: Option<String>,
+}
+
+/// Sync-relevant state of a stored repo.
+pub struct RepoSyncState {
+    pub id: i64,
+    pub pushed_at: Option<String>,
+    pub readme_pushed_at: Option<String>,
+    pub readme_etag: Option<String>,
+    pub has_readme: bool,
+}
+
+pub fn open(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = Connection::open(path).context("open sqlite db")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+pub fn open_in_memory() -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+fn migrate(conn: &Connection) -> Result<()> {
+    // additive migration for dbs created before thumbnails existed
+    let _ = conn.execute("ALTER TABLE files ADD COLUMN thumb BLOB", []);
+    // mtime at which OCR last ran for this file (NULL = never); files are
+    // re-OCRed when their mtime moves past it
+    let _ = conn.execute("ALTER TABLE files ADD COLUMN ocr_mtime INTEGER", []);
+    let _ = conn.execute("ALTER TABLE video_shots ADD COLUMN ocr_text TEXT", []);
+    let _ = conn.execute("ALTER TABLE clips ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", []);
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS repos (
+            id               INTEGER PRIMARY KEY,
+            full_name        TEXT NOT NULL,
+            description      TEXT,
+            language         TEXT,
+            topics           TEXT NOT NULL DEFAULT '[]',
+            stars            INTEGER NOT NULL DEFAULT 0,
+            html_url         TEXT NOT NULL,
+            homepage         TEXT,
+            archived         INTEGER NOT NULL DEFAULT 0,
+            fork             INTEGER NOT NULL DEFAULT 0,
+            starred_at       TEXT,
+            pushed_at        TEXT,
+            readme           TEXT,
+            readme_etag      TEXT,
+            readme_pushed_at TEXT
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS repo_fts USING fts5(
+            full_name, description, topics, readme,
+            content='repos', content_rowid='id', tokenize='unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS repos_ai AFTER INSERT ON repos BEGIN
+            INSERT INTO repo_fts(rowid, full_name, description, topics, readme)
+            VALUES (new.id, new.full_name, new.description, new.topics, new.readme);
+        END;
+        CREATE TRIGGER IF NOT EXISTS repos_ad AFTER DELETE ON repos BEGIN
+            INSERT INTO repo_fts(repo_fts, rowid, full_name, description, topics, readme)
+            VALUES ('delete', old.id, old.full_name, old.description, old.topics, old.readme);
+        END;
+        CREATE TRIGGER IF NOT EXISTS repos_au AFTER UPDATE ON repos BEGIN
+            INSERT INTO repo_fts(repo_fts, rowid, full_name, description, topics, readme)
+            VALUES ('delete', old.id, old.full_name, old.description, old.topics, old.readme);
+            INSERT INTO repo_fts(rowid, full_name, description, topics, readme)
+            VALUES (new.id, new.full_name, new.description, new.topics, new.readme);
+        END;
+
+        -- pre-1.0 schema step: repo single-vector embeddings replaced by
+        -- chunked ones; dropped vectors rebuild on the next embed pass
+        DROP TABLE IF EXISTS embeddings;
+
+        CREATE TABLE IF NOT EXISTS repo_chunks (
+            repo_id   INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+            chunk_idx INTEGER NOT NULL,
+            doc_hash  TEXT NOT NULL,
+            dim       INTEGER NOT NULL,
+            vec       BLOB NOT NULL,
+            PRIMARY KEY (repo_id, chunk_idx)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_repos_starred_at ON repos(starred_at DESC);
+
+        -- local file search: only explicitly added folders are ever scanned
+        CREATE TABLE IF NOT EXISTS folders (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE
+        );
+
+        CREATE TABLE IF NOT EXISTS files (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+            path      TEXT NOT NULL UNIQUE,
+            name      TEXT NOT NULL,
+            ext       TEXT,
+            size      INTEGER NOT NULL,
+            mtime     INTEGER NOT NULL,
+            content   TEXT,
+            thumb     BLOB,
+            ocr_mtime INTEGER,
+            changed   INTEGER
+        );
+
+        -- OCR failures must not monopolize the first N document slots after
+        -- every filesystem change. The mtime key permits instant retry on edits.
+        CREATE TABLE IF NOT EXISTS file_ocr_failures (
+            file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            mtime INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 1,
+            retry_at INTEGER NOT NULL
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+            name, path, content,
+            content='files', content_rowid='id', tokenize='unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+            INSERT INTO files_fts(rowid, name, path, content)
+            VALUES (new.id, new.name, new.path, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, name, path, content)
+            VALUES ('delete', old.id, old.name, old.path, old.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, name, path, content)
+            VALUES ('delete', old.id, old.name, old.path, old.content);
+            INSERT INTO files_fts(rowid, name, path, content)
+            VALUES (new.id, new.name, new.path, new.content);
+        END;
+
+        -- pre-1.0 schema step: single-vector-per-file replaced by chunks;
+        -- dropped vectors rebuild automatically on the next index pass
+        DROP TABLE IF EXISTS file_embeddings;
+
+        CREATE TABLE IF NOT EXISTS file_chunks (
+            file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            chunk_idx INTEGER NOT NULL,
+            doc_hash  TEXT NOT NULL,
+            dim       INTEGER NOT NULL,
+            vec       BLOB NOT NULL,
+            PRIMARY KEY (file_id, chunk_idx)
+        );
+
+        -- browser bookmarks, mirrored from local browser stores
+        CREATE TABLE IF NOT EXISTS bookmarks (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            url      TEXT NOT NULL,
+            title    TEXT NOT NULL,
+            folder   TEXT NOT NULL DEFAULT '',
+            browser  TEXT NOT NULL,
+            added_at INTEGER,
+            UNIQUE(browser, url, folder, title)
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS bookmarks_fts USING fts5(
+            title, url, folder,
+            content='bookmarks', content_rowid='id', tokenize='unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS bookmarks_ai AFTER INSERT ON bookmarks BEGIN
+            INSERT INTO bookmarks_fts(rowid, title, url, folder)
+            VALUES (new.id, new.title, new.url, new.folder);
+        END;
+        CREATE TRIGGER IF NOT EXISTS bookmarks_ad AFTER DELETE ON bookmarks BEGIN
+            INSERT INTO bookmarks_fts(bookmarks_fts, rowid, title, url, folder)
+            VALUES ('delete', old.id, old.title, old.url, old.folder);
+        END;
+        CREATE TRIGGER IF NOT EXISTS bookmarks_au AFTER UPDATE ON bookmarks BEGIN
+            INSERT INTO bookmarks_fts(bookmarks_fts, rowid, title, url, folder)
+            VALUES ('delete', old.id, old.title, old.url, old.folder);
+            INSERT INTO bookmarks_fts(rowid, title, url, folder)
+            VALUES (new.id, new.title, new.url, new.folder);
+        END;
+
+        CREATE TABLE IF NOT EXISTS bookmark_vecs (
+            bookmark_id INTEGER PRIMARY KEY REFERENCES bookmarks(id) ON DELETE CASCADE,
+            doc_hash    TEXT NOT NULL,
+            dim         INTEGER NOT NULL,
+            vec         BLOB NOT NULL
+        );
+
+        -- browser history, mirrored from local history stores (top pages only)
+        CREATE TABLE IF NOT EXISTS history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            url         TEXT NOT NULL,
+            title       TEXT NOT NULL,
+            browser     TEXT NOT NULL,
+            visit_count INTEGER NOT NULL DEFAULT 1,
+            last_visit  INTEGER,
+            UNIQUE(browser, url)
+        );
+
+        -- search results list every browser holding a URL (and frecency
+        -- looks hits up by URL)
+        CREATE INDEX IF NOT EXISTS bookmarks_url ON bookmarks(url);
+        CREATE INDEX IF NOT EXISTS history_url ON history(url);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+            title, url,
+            content='history', content_rowid='id', tokenize='unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
+            INSERT INTO history_fts(rowid, title, url) VALUES (new.id, new.title, new.url);
+        END;
+        CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
+            INSERT INTO history_fts(history_fts, rowid, title, url)
+            VALUES ('delete', old.id, old.title, old.url);
+        END;
+        CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
+            INSERT INTO history_fts(history_fts, rowid, title, url)
+            VALUES ('delete', old.id, old.title, old.url);
+            INSERT INTO history_fts(rowid, title, url) VALUES (new.id, new.title, new.url);
+        END;
+
+        CREATE TABLE IF NOT EXISTS history_vecs (
+            history_id INTEGER PRIMARY KEY REFERENCES history(id) ON DELETE CASCADE,
+            doc_hash   TEXT NOT NULL,
+            dim        INTEGER NOT NULL,
+            vec        BLOB NOT NULL
+        );
+
+        -- clipboard history (opt-in; text only). content_hash dedupes repeats.
+        CREATE TABLE IF NOT EXISTS clips (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            content      TEXT NOT NULL,
+            content_hash TEXT NOT NULL UNIQUE,
+            first_copied INTEGER NOT NULL,
+            last_copied  INTEGER NOT NULL,
+            copy_count   INTEGER NOT NULL DEFAULT 1,
+            -- pinned clips float to the top and survive count/age pruning
+            pinned       INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS clips_fts USING fts5(
+            content,
+            content='clips', content_rowid='id', tokenize='unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS clips_ai AFTER INSERT ON clips BEGIN
+            INSERT INTO clips_fts(rowid, content) VALUES (new.id, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS clips_ad AFTER DELETE ON clips BEGIN
+            INSERT INTO clips_fts(clips_fts, rowid, content)
+            VALUES ('delete', old.id, old.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS clips_au AFTER UPDATE ON clips BEGIN
+            INSERT INTO clips_fts(clips_fts, rowid, content)
+            VALUES ('delete', old.id, old.content);
+            INSERT INTO clips_fts(rowid, content) VALUES (new.id, new.content);
+        END;
+
+        CREATE TABLE IF NOT EXISTS clip_vecs (
+            clip_id  INTEGER PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+            doc_hash TEXT NOT NULL,
+            dim      INTEGER NOT NULL,
+            vec      BLOB NOT NULL
+        );
+
+        -- SigLIP space for images; separate from the e5 text space by design.
+        -- dim = 0 marks "tried and failed" (corrupt file), so it is not retried.
+        CREATE TABLE IF NOT EXISTS image_embeddings (
+            file_id  INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            doc_hash TEXT NOT NULL,
+            dim      INTEGER NOT NULL,
+            vec      BLOB NOT NULL
+        );
+
+        -- video shot index: per-file bookkeeping + one row per representative
+        -- frame, each carrying its shot's time range and a SigLIP vector
+        CREATE TABLE IF NOT EXISTS video_index (
+            file_id     INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            mtime       INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            shot_count  INTEGER NOT NULL DEFAULT 0,
+            indexed_at  INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS video_shots (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            start_ms  INTEGER NOT NULL,
+            end_ms    INTEGER NOT NULL,
+            ts_ms     INTEGER NOT NULL,
+            thumb     TEXT,
+            embedding BLOB,
+            model     TEXT,
+            -- OCR of the representative frame: NULL = not attempted yet,
+            -- '' = attempted, no readable text
+            ocr_text  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_video_shots_file ON video_shots(file_id);
+
+        -- frecency: how often/recently the user picked a result. Keys are
+        -- stable identities (path/url/target/repo id), never row ids.
+        CREATE TABLE IF NOT EXISTS hit_stats (
+            kind      TEXT NOT NULL,
+            key       TEXT NOT NULL,
+            uses      INTEGER NOT NULL DEFAULT 0,
+            last_used INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (kind, key)
+        );
+
+        -- things the user asked the daily recall card never to show again
+        CREATE TABLE IF NOT EXISTS recall_skip (
+            kind TEXT NOT NULL,
+            key  TEXT NOT NULL,
+            PRIMARY KEY (kind, key)
+        );
+        "#,
+    )
+    .context("run migrations")?;
+
+    // additive column migrations (SQLite has no ADD COLUMN IF NOT EXISTS):
+    // clips grew image support in 0.1.19
+    ensure_column(conn, "clips", "kind", "TEXT NOT NULL DEFAULT 'text'")?;
+    ensure_column(conn, "clips", "image", "BLOB")?;
+    ensure_column(conn, "clips", "thumb", "TEXT")?;
+    ensure_column(conn, "clips", "width", "INTEGER")?;
+    ensure_column(conn, "clips", "height", "INTEGER")?;
+    // when a file last arrived or changed: the later of its mtime and its
+    // creation time, since a copied or unzipped file keeps an old mtime (on
+    // Windows; APFS moves the birth time back with it, so macOS cannot tell).
+    // Rows indexed before it existed get their mtime, once, and only those
+    // from the last week: older ones can never reach the list, and every
+    // row updated here also rewrites its full-text entry (files_au).
+    if ensure_column(conn, "files", "changed", "INTEGER")? {
+        conn.execute(
+            "UPDATE files SET changed = mtime WHERE mtime >= CAST(strftime('%s', 'now') AS INTEGER) - 8 * 86400",
+            [],
+        )?;
+    }
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_changed ON files(changed)", [])?;
+    // Accelerates exact-preserving substring fallback: WHERE name/content LIKE
+    // ORDER BY mtime DESC LIMIT N. Row contents and FTS index are unchanged.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_mtime_search ON files(mtime DESC)", [])?;
+    // web preview details (#13): the earliest visit a browser still keeps,
+    // and the page summary Firefox records; filled by the next history sync
+    ensure_column(conn, "history", "first_visit", "INTEGER")?;
+    ensure_column(conn, "history", "description", "TEXT")?;
+    // zips indexed before their entry lists were: once, mark them changed so
+    // the next walk reads them again (the walk re-reads a file whose mtime
+    // differs from the index's)
+    if meta_get(conn, "zip_listing")?.as_deref() != Some("1") {
+        conn.execute("UPDATE files SET mtime = -1 WHERE lower(ext) = 'zip' AND content IS NULL", [])?;
+        meta_set(conn, "zip_listing", "1")?;
+    }
+    conn.execute_batch(
+        r#"
+        -- SigLIP vectors for image clips (text clips stay in clip_vecs/e5)
+        CREATE TABLE IF NOT EXISTS clip_image_vecs (
+            clip_id INTEGER PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+            dim     INTEGER NOT NULL,
+            vec     BLOB NOT NULL
+        );
+
+        -- app icons across launches (apps::IconCache): a row stays valid
+        -- while the app's stamp (its modification time) is unchanged; a
+        -- NULL image records that the OS had no icon for it
+        CREATE TABLE IF NOT EXISTS app_icons (
+            target TEXT PRIMARY KEY,
+            stamp  INTEGER NOT NULL,
+            mime   TEXT,
+            image  BLOB
+        );
+        "#,
+    )?;
+
+    // STEP17: durable, sparse work queue. Existing text vectors are never
+    // rewritten by this migration. Each job is removed in the SAME
+    // transaction that commits its file's replacement vectors.
+    conn.execute_batch(r#"
+        CREATE TABLE IF NOT EXISTS file_embed_jobs (
+            file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+            state TEXT NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending', 'error')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            retry_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS file_embed_jobs_pending
+            ON file_embed_jobs(state, file_id);
+        CREATE INDEX IF NOT EXISTS file_embed_jobs_retry
+            ON file_embed_jobs(state, retry_at);
+        CREATE TRIGGER IF NOT EXISTS file_embed_jobs_insert
+        AFTER INSERT ON files WHEN NEW.content IS NOT NULL
+        BEGIN
+            INSERT INTO file_embed_jobs(file_id) VALUES (NEW.id)
+            ON CONFLICT(file_id) DO UPDATE SET
+                state = 'pending', attempts = 0, last_error = NULL, retry_at = 0;
+        END;
+        CREATE TRIGGER IF NOT EXISTS file_embed_jobs_update
+        AFTER UPDATE OF name, path, content ON files
+        WHEN OLD.name IS NOT NEW.name OR OLD.path IS NOT NEW.path
+             OR OLD.content IS NOT NEW.content
+        BEGIN
+            DELETE FROM file_embed_jobs
+              WHERE file_id = NEW.id AND NEW.content IS NULL;
+            INSERT INTO file_embed_jobs(file_id)
+                SELECT NEW.id WHERE NEW.content IS NOT NULL
+            ON CONFLICT(file_id) DO UPDATE SET
+                state = 'pending', attempts = 0, last_error = NULL, retry_at = 0;
+        END;
+    "#)?;
+    // Seed exactly once from missing embeddings, using only indexed IDs.
+    // Reopening the database and waking from sleep never re-reads 864M chars.
+    if meta_get(conn, "step17_embed_queue_seeded")?.is_none() {
+        let tx = write_tx(conn)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO file_embed_jobs(file_id)
+             SELECT f.id FROM files f
+             WHERE f.content IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM file_chunks c WHERE c.file_id = f.id)",
+            [],
+        )?;
+        // Verify the files that already have old embeddings ONCE during
+        // migration. This catches edits made before the new triggers existed,
+        // without hashing the 60K-document pending backlog on every launch.
+        {
+            let mut stmt = tx.prepare(
+                "SELECT f.id, f.name, f.path, f.content, c.doc_hash
+                 FROM files f JOIN file_chunks c
+                   ON c.file_id=f.id AND c.chunk_idx=0
+                 WHERE f.content IS NOT NULL",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let name: String = row.get(1)?;
+                let path: String = row.get(2)?;
+                let content: String = row.get(3)?;
+                let old_hash: String = row.get(4)?;
+                if crate::embed::doc_hash(&format!("{name}\n{path}\n{content}")) != old_hash {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO file_embed_jobs(file_id) VALUES (?1)", [id],
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO meta(key,value)
+             VALUES('step17_embed_queue_seeded','1')", [],
+        )?;
+        // Existing step16 installs already scanned at startup. Defer the
+        // next reconciliation instead of scanning 100K paths on each launch.
+        tx.execute(
+            "INSERT OR IGNORE INTO meta(key,value)
+             VALUES('last_full_rescan_at', CAST(strftime('%s','now') AS TEXT))", [],
+        )?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+/// ALTER TABLE … ADD COLUMN, only when the column is missing. True when it
+/// was added just now.
+fn ensure_column(conn: &Connection, table: &str, col: &str, ddl: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if existing.iter().any(|c| c == col) {
+        return Ok(false);
+    }
+    conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ddl}"), [])?;
+    Ok(true)
+}
+
+// ---------- meta ----------
+
+/// A transaction that takes the write lock at BEGIN (IMMEDIATE), where the
+/// busy timeout covers the wait. A deferred one that writes after another
+/// connection committed fails at once with SQLITE_BUSY_SNAPSHOT (517), no
+/// waiting: the bookmark sync hit that during first-start indexing.
+pub fn write_tx(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    Ok(rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?)
+}
+
+pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+pub fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// Disconnect GitHub (issue #6): the token, the account name, the star
+/// index with its READMEs and vectors, and which repos were opened. One
+/// transaction, so a crash leaves either the old account or none.
+pub fn forget_github(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM meta WHERE key IN ('token', 'username', 'last_sync')", [])?;
+    tx.execute("DELETE FROM repos", [])?; // chunks and FTS rows follow (cascade, trigger)
+    tx.execute("DELETE FROM hit_stats WHERE kind = 'repo'", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+// ---------- repos ----------
+
+pub fn upsert_repo(conn: &Connection, repo: &Repo) -> Result<()> {
+    let topics = serde_json::to_string(&repo.topics)?;
+    conn.execute(
+        r#"
+        INSERT INTO repos (id, full_name, description, language, topics, stars,
+                           html_url, homepage, archived, fork, starred_at, pushed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(id) DO UPDATE SET
+            full_name = excluded.full_name,
+            description = excluded.description,
+            language = excluded.language,
+            topics = excluded.topics,
+            stars = excluded.stars,
+            html_url = excluded.html_url,
+            homepage = excluded.homepage,
+            archived = excluded.archived,
+            fork = excluded.fork,
+            starred_at = excluded.starred_at,
+            pushed_at = excluded.pushed_at
+        "#,
+        params![
+            repo.id,
+            repo.full_name,
+            repo.description,
+            repo.language,
+            topics,
+            repo.stars,
+            repo.html_url,
+            repo.homepage,
+            repo.archived as i64,
+            repo.fork as i64,
+            repo.starred_at,
+            repo.pushed_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete repos whose id is NOT in `keep` (unstarred). Returns number removed.
+pub fn delete_repos_not_in(conn: &mut Connection, keep: &[i64]) -> Result<usize> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("CREATE TEMP TABLE IF NOT EXISTS keep_ids (id INTEGER PRIMARY KEY)", [])?;
+    tx.execute("DELETE FROM keep_ids", [])?;
+    {
+        let mut stmt = tx.prepare("INSERT OR IGNORE INTO keep_ids(id) VALUES (?1)")?;
+        for id in keep {
+            stmt.execute([id])?;
+        }
+    }
+    let removed = tx.execute(
+        "DELETE FROM repos WHERE id NOT IN (SELECT id FROM keep_ids)",
+        [],
+    )?;
+    tx.execute("DELETE FROM keep_ids", [])?;
+    tx.commit()?;
+    Ok(removed)
+}
+
+pub fn repo_sync_states(conn: &Connection) -> Result<Vec<RepoSyncState>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, pushed_at, readme_pushed_at, readme_etag, readme IS NOT NULL FROM repos",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(RepoSyncState {
+                id: r.get(0)?,
+                pushed_at: r.get(1)?,
+                readme_pushed_at: r.get(2)?,
+                readme_etag: r.get(3)?,
+                has_readme: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn set_readme(
+    conn: &Connection,
+    repo_id: i64,
+    readme: Option<&str>,
+    etag: Option<&str>,
+    pushed_at: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE repos SET readme = ?2, readme_etag = ?3, readme_pushed_at = ?4 WHERE id = ?1",
+        params![repo_id, readme, etag, pushed_at],
+    )?;
+    Ok(())
+}
+
+/// Mark readme as still-fresh (etag 304) without touching content.
+pub fn touch_readme(conn: &Connection, repo_id: i64, pushed_at: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE repos SET readme_pushed_at = ?2 WHERE id = ?1",
+        params![repo_id, pushed_at],
+    )?;
+    Ok(())
+}
+
+fn row_to_repo(r: &rusqlite::Row<'_>) -> rusqlite::Result<Repo> {
+    let topics_json: String = r.get(4)?;
+    Ok(Repo {
+        id: r.get(0)?,
+        full_name: r.get(1)?,
+        description: r.get(2)?,
+        language: r.get(3)?,
+        topics: serde_json::from_str(&topics_json).unwrap_or_default(),
+        stars: r.get(5)?,
+        html_url: r.get(6)?,
+        homepage: r.get(7)?,
+        archived: r.get::<_, i64>(8)? != 0,
+        fork: r.get::<_, i64>(9)? != 0,
+        starred_at: r.get(10)?,
+        pushed_at: r.get(11)?,
+    })
+}
+
+const REPO_COLS: &str = "id, full_name, description, language, topics, stars, \
+                         html_url, homepage, archived, fork, starred_at, pushed_at";
+
+/// Fetch repos by id, preserving the order of `ids`.
+pub fn repos_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<Repo>> {
+    let mut out = Vec::with_capacity(ids.len());
+    let mut stmt = conn.prepare(&format!("SELECT {REPO_COLS} FROM repos WHERE id = ?1"))?;
+    for id in ids {
+        if let Some(repo) = stmt.query_row([id], row_to_repo).optional()? {
+            out.push(repo);
+        }
+    }
+    Ok(out)
+}
+
+pub fn recent_repos(conn: &Connection, limit: usize) -> Result<Vec<Repo>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {REPO_COLS} FROM repos ORDER BY starred_at DESC, id DESC LIMIT ?1"
+    ))?;
+    let rows = stmt
+        .query_map([limit as i64], row_to_repo)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn repo_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0))?)
+}
+
+/// (id, composed-doc source fields) for docs whose embedding is missing or stale.
+pub struct EmbedCandidate {
+    pub id: i64,
+    pub full_name: String,
+    pub description: Option<String>,
+    pub topics: Vec<String>,
+    pub language: Option<String>,
+    pub readme: Option<String>,
+}
+
+pub fn embed_candidates(conn: &Connection) -> Result<Vec<EmbedCandidate>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.full_name, r.description, r.topics, r.language, r.readme
+         FROM repos r",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let topics_json: String = r.get(3)?;
+            Ok(EmbedCandidate {
+                id: r.get(0)?,
+                full_name: r.get(1)?,
+                description: r.get(2)?,
+                topics: serde_json::from_str(&topics_json).unwrap_or_default(),
+                language: r.get(4)?,
+                readme: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// repo_id -> per-repo doc_hash (identical across a repo's chunks).
+pub fn repo_chunk_hashes(conn: &Connection) -> Result<std::collections::HashMap<i64, String>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT repo_id, doc_hash FROM repo_chunks")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+    Ok(rows)
+}
+
+pub fn clear_repo_chunks(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM repo_chunks", [])?;
+    Ok(())
+}
+
+/// Replace a repo's chunk vectors atomically (a crash must never leave the
+/// new hash with a partial chunk set).
+pub fn put_repo_chunks(
+    conn: &Connection,
+    repo_id: i64,
+    doc_hash: &str,
+    vecs: &[Vec<f32>],
+) -> Result<()> {
+    let tx = write_tx(conn)?;
+    tx.execute("DELETE FROM repo_chunks WHERE repo_id = ?1", [repo_id])?;
+    for (idx, vec) in vecs.iter().enumerate() {
+        let bytes: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+        tx.execute(
+            "INSERT INTO repo_chunks(repo_id, chunk_idx, doc_hash, dim, vec)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![repo_id, idx as i64, doc_hash, vec.len() as i64, bytes],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// All repo chunk vectors as (repo_id, vec); repo_id repeats across chunks.
+pub fn all_repo_chunk_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
+    let mut stmt = conn.prepare("SELECT repo_id, dim, vec FROM repo_chunks")?;
+    let rows = stmt
+        .query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let dim: i64 = r.get(1)?;
+            let bytes: Vec<u8> = r.get(2)?;
+            Ok((id, dim as usize, bytes))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, dim, bytes) in rows {
+        if bytes.len() != dim * 4 {
+            continue; // corrupt row; skip rather than crash
+        }
+        let (chunks, _) = bytes.as_chunks::<4>();
+        let vec: Vec<f32> = chunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
+        out.push((id, vec));
+    }
+    Ok(out)
+}
+
+/// FTS5 BM25 search. Returns repo ids, best match first.
+pub fn fts_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<i64>> {
+    let fts_query = build_fts_query(query);
+    if fts_query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT rowid FROM repo_fts WHERE repo_fts MATCH ?1
+         ORDER BY bm25(repo_fts, 8.0, 4.0, 4.0, 1.0) LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![fts_query, limit as i64], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Sanitize free text into an FTS5 query: each token quoted, prefix-matched, AND-joined.
+pub fn build_fts_query(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|tok| tok.replace('"', ""))
+        .filter(|tok| !tok.is_empty())
+        .map(|tok| format!("\"{tok}\"*"))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zips_indexed_without_their_list_are_walked_again_once() {
+        let conn = open_in_memory().unwrap();
+        conn.execute("INSERT INTO folders(id, path) VALUES (1, '/w')", []).unwrap();
+        for (p, ext, content) in [("/w/a.zip", "zip", None), ("/w/b.ZIP", "ZIP", None), ("/w/c.zip", "zip", Some("x.txt")), ("/w/d.txt", "txt", None)] {
+            conn.execute(
+                "INSERT INTO files(folder_id, path, name, ext, size, mtime, content) VALUES (1, ?1, 'n', ?2, 1, 100, ?3)",
+                rusqlite::params![p, ext, content],
+            )
+            .unwrap();
+        }
+        // a database from before: the flag not set yet
+        conn.execute("DELETE FROM meta WHERE key = 'zip_listing'", []).unwrap();
+        migrate(&conn).unwrap();
+        let mtimes: Vec<(String, i64)> = conn
+            .prepare("SELECT path, mtime FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            mtimes,
+            vec![("/w/a.zip".into(), -1), ("/w/b.ZIP".into(), -1), ("/w/c.zip".into(), 100), ("/w/d.txt".into(), 100)]
+        );
+        // once: a zip added later with no list (an unreadable one) stays put
+        conn.execute("UPDATE files SET mtime = 200 WHERE path = '/w/a.zip'", []).unwrap();
+        migrate(&conn).unwrap();
+        let a: i64 = conn.query_row("SELECT mtime FROM files WHERE path = '/w/a.zip'", [], |r| r.get(0)).unwrap();
+        assert_eq!(a, 200);
+    }
+
+    #[test]
+    fn files_indexed_before_the_changed_column_get_it_from_a_recent_mtime() {
+        // a database from before the column: build today's, then take it out
+        let conn = open_in_memory().unwrap();
+        let now: i64 = conn.query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| r.get(0)).unwrap();
+        conn.execute("INSERT INTO folders(id, path) VALUES (1, '/w')", []).unwrap();
+        for (p, m) in [("/w/recent", now - 3600), ("/w/old", now - 30 * 86400)] {
+            conn.execute(
+                "INSERT INTO files(folder_id, path, name, size, mtime, content) VALUES (1, ?1, 'n', 1, ?2, 'searchable words')",
+                rusqlite::params![p, m],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("DROP INDEX idx_files_changed; ALTER TABLE files DROP COLUMN changed;").unwrap();
+        migrate(&conn).unwrap();
+        let got: Vec<(String, Option<i64>)> = conn
+            .prepare("SELECT path, changed FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(got, vec![("/w/old".into(), None), ("/w/recent".into(), Some(now - 3600))]);
+        // the full-text index survived the rewrite of the recent row
+        let hits: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'searchable'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hits, 2);
+        // a second open adds nothing and touches nothing
+        assert!(!ensure_column(&conn, "files", "changed", "INTEGER").unwrap());
+        migrate(&conn).unwrap();
+    }
+
+    fn sample(id: i64, name: &str, desc: &str) -> Repo {
+        Repo {
+            id,
+            full_name: name.into(),
+            description: Some(desc.into()),
+            language: Some("Rust".into()),
+            topics: vec!["cli".into()],
+            stars: 42,
+            html_url: format!("https://github.com/{name}"),
+            homepage: None,
+            archived: false,
+            fork: false,
+            starred_at: Some(format!("2026-01-{:02}T00:00:00Z", id)),
+            pushed_at: Some("2026-02-01T00:00:00Z".into()),
+        }
+    }
+
+    #[test]
+    fn upsert_fts_and_delete_roundtrip() {
+        let mut conn = open_in_memory().unwrap();
+        upsert_repo(&conn, &sample(1, "alice/scraper", "web scraping framework")).unwrap();
+        upsert_repo(&conn, &sample(2, "bob/parser", "json parser")).unwrap();
+        assert_eq!(repo_count(&conn).unwrap(), 2);
+
+        let hits = fts_search(&conn, "scraping", 10).unwrap();
+        assert_eq!(hits, vec![1]);
+
+        // update flows into FTS via trigger
+        upsert_repo(&conn, &sample(2, "bob/parser", "yaml parser")).unwrap();
+        assert_eq!(fts_search(&conn, "yaml", 10).unwrap(), vec![2]);
+        assert!(fts_search(&conn, "json", 10).unwrap().is_empty());
+
+        // unstar removes from repos + FTS + embeddings
+        put_repo_chunks(&conn, 1, "h", &[vec![0.1, 0.2]]).unwrap();
+        let removed = delete_repos_not_in(&mut conn, &[2]).unwrap();
+        assert_eq!(removed, 1);
+        assert!(fts_search(&conn, "scraping", 10).unwrap().is_empty());
+        assert!(all_repo_chunk_embeddings(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn write_tx_waits_for_another_writer_where_a_deferred_one_fails() {
+        let dir = std::env::temp_dir().join(format!("magpie-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("t.db");
+        let a = open(&path).unwrap();
+        let b = open(&path).unwrap();
+        meta_set(&a, "k", "0").unwrap();
+
+        // the failure the bookmark sync hit: a deferred transaction reads,
+        // another connection commits, the write then fails at once (517)
+        let tx = a.unchecked_transaction().unwrap();
+        let _: i64 = tx.query_row("SELECT count(*) FROM meta", [], |r| r.get(0)).unwrap();
+        meta_set(&b, "k", "1").unwrap();
+        let err = tx.execute("UPDATE meta SET value = '2' WHERE key = 'k'", []).unwrap_err();
+        assert_eq!(err.sqlite_error().map(|e| e.extended_code), Some(517), "SQLITE_BUSY_SNAPSHOT: {err}");
+        drop(tx);
+
+        // write_tx takes the lock at BEGIN, so the busy timeout covers the
+        // wait: another writer holds the lock for 300 ms, this one waits and
+        // then succeeds instead of failing
+        // (a signal, not a sleep: under load opening the connection alone can
+        // take longer than any fixed head start)
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let c = open(&path).unwrap();
+                let t = write_tx(&c).unwrap();
+                t.execute("UPDATE meta SET value = '3' WHERE key = 'k'", []).unwrap();
+                locked.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                t.commit().unwrap();
+            }
+        });
+        is_locked.recv().unwrap();
+        let t0 = std::time::Instant::now();
+        let tx = write_tx(&a).unwrap();
+        let _: i64 = tx.query_row("SELECT count(*) FROM meta", [], |r| r.get(0)).unwrap();
+        tx.execute("UPDATE meta SET value = '4' WHERE key = 'k'", []).unwrap();
+        tx.commit().unwrap();
+        holder.join().unwrap();
+        assert!(t0.elapsed().as_millis() >= 150, "it waited for the other writer ({:?})", t0.elapsed());
+        assert_eq!(meta_get(&a, "k").unwrap().as_deref(), Some("4"));
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forget_github_clears_the_account_and_its_index_only() {
+        let mut conn = open_in_memory().unwrap();
+        upsert_repo(&conn, &sample(1, "alice/scraper", "web scraping framework")).unwrap();
+        put_repo_chunks(&conn, 1, "h", &[vec![0.1, 0.2]]).unwrap();
+        for (k, v) in [("token", "t"), ("username", "alice"), ("last_sync", "1"), ("ui_lang", "zh")] {
+            meta_set(&conn, k, v).unwrap();
+        }
+        crate::frecency::record_use(&conn, "repo", "https://github.com/alice/scraper", 1).unwrap();
+        crate::frecency::record_use(&conn, "app", "notepad", 1).unwrap();
+
+        forget_github(&mut conn).unwrap();
+        assert_eq!(repo_count(&conn).unwrap(), 0);
+        assert!(fts_search(&conn, "scraping", 10).unwrap().is_empty());
+        assert!(all_repo_chunk_embeddings(&conn).unwrap().is_empty());
+        for k in ["token", "username", "last_sync"] {
+            assert_eq!(meta_get(&conn, k).unwrap(), None, "{k}");
+        }
+        assert_eq!(meta_get(&conn, "ui_lang").unwrap().as_deref(), Some("zh"), "other settings stay");
+        let kinds: Vec<String> = conn
+            .prepare("SELECT kind FROM hit_stats")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(kinds, ["app"], "only the repo history goes");
+    }
+
+    #[test]
+    fn embedding_blob_roundtrip() {
+        let conn = open_in_memory().unwrap();
+        upsert_repo(&conn, &sample(7, "x/y", "d")).unwrap();
+        let v = vec![0.25f32, -1.5, 3.75];
+        let v2 = vec![9.0f32, 8.0, 7.0];
+        put_repo_chunks(&conn, 7, "abc", &[v.clone(), v2.clone()]).unwrap();
+        let all = all_repo_chunk_embeddings(&conn).unwrap();
+        assert_eq!(all.len(), 2, "two chunks stored");
+        assert_eq!(all[0], (7, v.clone())); // byte-exact roundtrip
+        assert_eq!(all[1], (7, v2));
+        assert_eq!(repo_chunk_hashes(&conn).unwrap().get(&7).map(String::as_str), Some("abc"));
+        // replacing swaps the whole chunk set atomically
+        put_repo_chunks(&conn, 7, "def", std::slice::from_ref(&v)).unwrap();
+        assert_eq!(all_repo_chunk_embeddings(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fts_query_sanitized() {
+        assert_eq!(build_fts_query("hello world"), "\"hello\"* AND \"world\"*");
+        assert_eq!(build_fts_query("a \"b\" NOT"), "\"a\"* AND \"b\"* AND \"NOT\"*");
+        assert_eq!(build_fts_query("  "), "");
+        // FTS operators are neutralized inside quotes
+        let conn = open_in_memory().unwrap();
+        upsert_repo(&conn, &sample(1, "a/b", "c")).unwrap();
+        assert!(fts_search(&conn, "AND OR ( ) *", 5).is_ok());
+    }
+
+    #[test]
+    fn recent_ordering() {
+        let conn = open_in_memory().unwrap();
+        upsert_repo(&conn, &sample(1, "a/a", "x")).unwrap();
+        upsert_repo(&conn, &sample(3, "c/c", "x")).unwrap();
+        upsert_repo(&conn, &sample(2, "b/b", "x")).unwrap();
+        let recents = recent_repos(&conn, 10).unwrap();
+        let ids: Vec<i64> = recents.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![3, 2, 1]);
+    }
+}

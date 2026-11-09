@@ -1,0 +1,21 @@
+/* All rules are scoped to the isolated Test diagnostic screen. */
+.ls-test-diagnostics { box-sizing: border-box; width: 100%; max-width: 100%; min-width: 0; padding: 18px 0 12px; overflow-wrap: anywhere; }
+.ls-test-diagnostics *, .ls-test-diagnostics *::before, .ls-test-diagnostics *::after { box-sizing: border-box; }
+.ls-test-diagnostics h3 { font-size: 17px; font-weight: 650; line-height: 1.35; margin: 0 0 6px; }
+.ls-test-diagnostics h4 { font-size: 14px; line-height: 1.4; font-weight: 650; margin: 0; }
+.ls-test-diagnostics p { font-size: 12.5px; line-height: 1.5; max-width: 100%; margin: 6px 0 0; color: var(--text-dim); white-space: normal; overflow-wrap: anywhere; }
+.ls-test-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; min-width: 0; padding: 0 2px 16px; }
+.ls-test-heading > div { min-width: 0; flex: 1 1 220px; }
+.ls-test-panel { min-width: 0; padding: 14px 0; border-top: 1px solid var(--border); }
+.ls-test-panel .ls-test-status { font-weight: 600; color: var(--text); }
+.ls-test-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 124px), 1fr)); gap: 8px; margin: 12px 0; }
+.ls-test-metrics > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+.ls-test-metrics strong { font-size: 19px; font-variant-numeric: tabular-nums; color: var(--text); }
+.ls-test-metrics span { font-size: 11px; color: var(--text-dim); }
+.ls-test-actions { min-width: 0; display: flex; flex-wrap: wrap; justify-content: flex-start; align-items: center; gap: 8px; margin-top: 12px; }
+.ls-test-actions .source, .ls-test-heading .source { flex: 0 1 auto; max-width: 100%; white-space: normal; height: auto; min-height: 33px; padding: 7px 12px; text-align: center; overflow-wrap: anywhere; }
+.ls-test-diagnostics .ls-test-note { color: var(--text-faint); font-size: 11.5px; margin-top: 10px; }
+.ls-test-diagnostics .ls-test-message { margin: 14px 0 0; white-space: pre-wrap; border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+/* The diagnostic view can use the available window height instead of RC9's
+   580px settings cap; affects only the isolated Test panel. */
+/* Layout size is now controlled globally by TestResponsiveUI.css */

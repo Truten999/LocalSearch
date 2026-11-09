@@ -1,0 +1,68 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LocalSearch DEV Decision",
+  "version": "1.0.3",
+  "identifier": "org.localsearch.community.dev",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "LocalSearch DEV — проверка решения",
+        "width": 720,
+        "height": 480,
+        "resizable": true,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": false,
+        "center": true,
+        "shadow": true,
+        "visible": false,
+        "windowEffects": {
+          "effects": [
+            "acrylic",
+            "hudWindow"
+          ],
+          "radius": 14
+        },
+        "minWidth": 720,
+        "minHeight": 320,
+        "titleBarStyle": "Visible",
+        "hiddenTitle": false,
+        "maximizable": true,
+        "minimizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": false,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/native-ocr/": "native-ocr/"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": []
+    }
+  }
+}

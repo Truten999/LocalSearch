@@ -1,0 +1,7377 @@
+//! Thin Tauri shell over magpie-core: window/tray/shortcut plumbing + commands.
+
+// get_status builds one json! literal with every setting and counter the
+// settings page shows; past ~40 keys the macro's token muncher needs more
+// room than the default 128 levels
+#![recursion_limit = "256"]
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+
+use anyhow::Result;
+use serde_json::json;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::Mutex as AsyncMutex;
+
+use magpie_core::bookmarks;
+use magpie_core::clips::{self, ClipHit};
+use magpie_core::db;
+use magpie_core::embed::Embedder;
+use magpie_core::files::{self, FileHit, FolderInfo};
+use magpie_core::github::GithubClient;
+use magpie_core::history;
+use magpie_core::search::{self, SearchResult, VectorStore};
+use magpie_core::siglip::Siglip;
+use magpie_core::sync;
+
+mod cli;
+#[cfg(target_os = "macos")]
+mod local_vision;
+pub mod mcp;
+mod wayland_hotkey;
+mod watch;
+mod offline_voice;
+mod model_library;
+mod test_diagnostics;
+
+// Isolated QA-only build; never enabled in the production QA 1.0.1.
+const WORK_SAFE: bool = option_env!("LOCALSEARCH_WORK_SAFE").is_some();
+
+// Step 24: audio never leaves this Mac. Forward a small WAV recording to
+// the explicitly enabled FluidVoice loopback API; no cloud, disk or logs.
+#[tauri::command]
+async fn transcribe_fluidvoice(audio_b64: String) -> Result<String, String> {
+    if audio_b64.is_empty() || audio_b64.len() > 10_700_000 {
+        return Err("Некорректный размер аудиозаписи".into());
+    }
+    // The application does not depend on reqwest. Use the standard library
+    // for one bounded HTTP/1.1 POST to the fixed FluidVoice loopback endpoint.
+    // Blocking socket I/O is kept off the Tauri async runtime.
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+        use std::time::Duration;
+
+        let address = SocketAddr::from(([127, 0, 0, 1], 47_733));
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+            .map_err(|e| format!("FluidVoice недоступен на 127.0.0.1:47733: {e}"))?;
+        stream.set_read_timeout(Some(Duration::from_secs(120)))
+            .map_err(|e| format!("FluidVoice: ошибка таймаута чтения: {e}"))?;
+        stream.set_write_timeout(Some(Duration::from_secs(15)))
+            .map_err(|e| format!("FluidVoice: ошибка таймаута записи: {e}"))?;
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "audioBase64": audio_b64,
+            "filename": "localsearch-voice.wav"
+        })).map_err(|e| format!("FluidVoice: ошибка формирования JSON: {e}"))?;
+        let header = format!(
+            "POST /v1/transcribe HTTP/1.1\r\nHost: 127.0.0.1:47733\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes())
+            .and_then(|_| stream.write_all(&body))
+            .map_err(|e| format!("FluidVoice: ошибка передачи аудио: {e}"))?;
+
+        // FluidVoice responds with Content-Length and Connection: close.
+        // Bound the response to prevent unexpected memory growth.
+        let mut response = Vec::new();
+        stream.take(1_048_576).read_to_end(&mut response)
+            .map_err(|e| format!("FluidVoice: ошибка получения ответа: {e}"))?;
+        let split = response.windows(4).position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| "FluidVoice вернул некорректный HTTP-ответ".to_string())?;
+        let status = std::str::from_utf8(&response[..split])
+            .map_err(|_| "FluidVoice вернул некорректные HTTP-заголовки".to_string())?
+            .lines().next().unwrap_or("");
+        if status.split_ascii_whitespace().nth(1) != Some("200") {
+            return Err(format!("FluidVoice вернул {}", status));
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&response[split + 4..])
+            .map_err(|e| format!("Ответ FluidVoice не является JSON: {e}"))?;
+        let text = payload.get("text").and_then(serde_json::Value::as_str)
+            .unwrap_or("").trim();
+        if text.is_empty() {
+            return Err("FluidVoice не распознал речь".into());
+        }
+        Ok(text.to_owned())
+    }).await.map_err(|e| format!("Ошибка фонового распознавания: {e}"))?
+
+}
+
+
+/// Status for the optional offline voice model; no download occurs here.
+#[tauri::command]
+async fn local_voice_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    Ok(offline_voice::status(&state.model_dir))
+}
+
+/// This is a separate experimental command: the installed RC9 microphone
+/// continues to use FluidVoice until offline quality is validated on macOS.
+#[tauri::command]
+async fn transcribe_local_voice(
+    state: State<'_, AppState>,
+    audio_b64: String,
+) -> Result<String, String> {
+    let model_dir = state.model_dir.clone();
+    tokio::task::spawn_blocking(move || offline_voice::transcribe_voice(&model_dir, &audio_b64))
+        .await.map_err(|e| format!("Ошибка фонового распознавания: {e}"))?
+}
+
+struct AppState {
+    db_path: PathBuf,
+    model_dir: PathBuf,
+    db: AsyncMutex<magpie_core::rusqlite::Connection>,
+    /// Read-only twin of `db` for interactive searches. Separate so that
+    /// cancelling a stale search can never touch a write: the interrupt
+    /// handle below reaches only this connection, and WAL keeps its reads
+    /// out of the writer's way.
+    search_db: AsyncMutex<magpie_core::rusqlite::Connection>,
+    search_interrupt: magpie_core::rusqlite::InterruptHandle,
+    /// Bumped by every incoming search; a search that finds a newer ticket
+    /// than its own when it reaches the head of the queue skips its work.
+    search_gen: AtomicU64,
+    embedder: Arc<StdMutex<Option<Embedder>>>,
+    model_status: Arc<StdMutex<String>>,
+    siglip: Arc<StdMutex<Option<Siglip>>>,
+    siglip_status: Arc<StdMutex<String>>,
+    /// All embedding vectors, resident; reloaded after every embed/sync pass.
+    store: Arc<StdMutex<VectorStore>>,
+    sync_running: Arc<AtomicBool>,
+    local_indexing: Arc<AtomicBool>,
+    /// Number of live file-embedding passes (not the number queued in SQLite).
+    file_embedding_passes: Arc<AtomicUsize>,
+    /// Whether this process currently owns an idle-sleep inhibitor.
+    sleep_hold_active: Arc<AtomicBool>,
+    video_indexing: Arc<AtomicBool>,
+    /// Human-readable video-index problem ("" = fine), e.g. missing ffmpeg.
+    video_note: Arc<StdMutex<String>>,
+    /// ffmpeg resolution state: "" (unchecked) / "system" / "bundled" /
+    /// "downloading ffmpeg… N%" / "missing: <why>".
+    ffmpeg_status: Arc<StdMutex<String>>,
+    /// One model init at a time: concurrent inits would race on the same
+    /// .part download files. The reinit flag queues one follow-up attempt
+    /// (used when the mirror changes while an init is already running).
+    model_initing: Arc<AtomicBool>,
+    model_reinit: Arc<AtomicBool>,
+    siglip_initing: Arc<AtomicBool>,
+    siglip_reinit: Arc<AtomicBool>,
+    /// Semantic search paused to free the models' memory (tray / settings,
+    /// issue #8): no model loads until it is resumed or magpie restarts.
+    models_paused: Arc<AtomicBool>,
+    /// Installed-app list, enumerated once at startup, refreshable on demand.
+    apps: Arc<StdMutex<Vec<magpie_core::apps::AppEntry>>>,
+    /// App icons as data URLs, by launch target; None = the OS had none.
+    /// Filled on first display and kept for the session.
+    app_icons: Arc<StdMutex<std::collections::HashMap<String, Option<String>>>>,
+    /// The stamp (`apps::icon_stamp`) each cached icon was read at, so a
+    /// search can tell cheaply whether an app on screen changed since.
+    icon_stamps: Arc<StdMutex<std::collections::HashMap<String, i64>>>,
+    /// `timer 25m …` countdowns that have not fired yet
+    timers: Arc<StdMutex<Vec<TimerEntry>>>,
+    timer_seq: Arc<AtomicU64>,
+    /// Version string of a pending update ("" = none) — drives the tray
+    /// badge and the extra tray menu item.
+    update_badge: Arc<StdMutex<String>>,
+    /// OCR engine, present only while the setting is on and init succeeded.
+    ocr: Arc<StdMutex<Option<magpie_core::ocr::Ocr>>>,
+    /// "" (off/unchecked) / download progress / "ready" / "failed: <why>".
+    ocr_status: Arc<StdMutex<String>>,
+    ocr_initing: Arc<AtomicBool>,
+    ocr_reinit: Arc<AtomicBool>,
+    ocr_indexing: Arc<AtomicBool>,
+    /// Desired state of the clipboard watcher; the thread exits when false.
+    clip_watch: Arc<AtomicBool>,
+    /// Liveness guard so toggling can't stack watcher threads.
+    clip_thread_alive: Arc<AtomicBool>,
+    /// The MCP server for AI assistants while it runs (see `mcp`).
+    mcp: Arc<StdMutex<Option<mcp::Server>>>,
+    /// "" (off) / "starting" / "listening" / "failed: <why>".
+    mcp_status: Arc<StdMutex<String>>,
+    /// The file watcher over the indexed folders while it runs (see `watch`);
+    /// dropping it stops the events.
+    watcher: Arc<StdMutex<Option<notify::RecommendedWatcher>>>,
+    /// Changed paths the watcher has reported and the ticker has not yet
+    /// handed to a scoped re-index.
+    pending: Arc<StdMutex<watch::Pending>>,
+    /// "" (off) / "watching" / "failed: <why>".
+    watch_status: Arc<StdMutex<String>>,
+    /// How many of the registered folders the watcher covers.
+    watched_folders: Arc<AtomicUsize>,
+}
+
+/// Take a model's lock for a pass that has to wait for it (the local index
+/// pass). While it waits, the long background passes end at their next
+/// batch and hand the model over (see `threads::want`).
+fn lock_model<T>(m: &StdMutex<T>, model: magpie_core::threads::Model) -> std::sync::MutexGuard<'_, T> {
+    let _waiting = magpie_core::threads::want(model);
+    m.lock().unwrap()
+}
+
+/// Run a long background pass in rounds: each round takes the model lock
+/// (inside `round`) and ends early when another pass waits for the model;
+/// the next round starts once that pass has the lock. Blocking. Returns the
+/// items embedded over all rounds.
+fn run_yielding(
+    model: magpie_core::threads::Model,
+    mut round: impl FnMut() -> Result<usize>,
+) -> Result<usize> {
+    use magpie_core::threads;
+    let _ = threads::take_yielded(model); // a stale flag is not ours
+    let mut total = 0;
+    loop {
+        // let a waiter take the lock before this round grabs it again
+        while threads::waited_for(model) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        total += round()?;
+        if !threads::take_yielded(model) {
+            return Ok(total);
+        }
+    }
+}
+
+/// Count actual in-flight file embedding, including early error/return paths.
+struct FileEmbeddingPass(Arc<AtomicUsize>);
+impl FileEmbeddingPass {
+    fn start(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+impl Drop for FileEmbeddingPass {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
+}
+
+/// Reload the resident vector store from the database.
+fn reload_store(db_path: &std::path::Path, store: &Arc<StdMutex<VectorStore>>) {
+    if let Ok(conn) = db::open(db_path) {
+        if let Ok(fresh) = VectorStore::load(&conn) {
+            *store.lock().unwrap() = fresh;
+        }
+    }
+}
+
+fn err_str<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
+/// Take the search connection, cancelling whatever search still runs on it.
+///
+/// A new keystroke makes the previous query's answer worthless, but before
+/// this the query kept running anyway and held the connection: retyping
+/// "vscode" could queue every later search behind an expensive single-"v"
+/// scan. Interrupting makes the stale query error out and release the lock
+/// within a statement step.
+///
+/// Returns None when a newer search overtook this one while it waited for the
+/// lock: only the newest ticket does any work, the rest hand the lock straight
+/// on. Interrupting with no query mid-flight is harmless — SQLite only stops
+/// statements that were already running when the flag was raised.
+async fn take_search_conn<'a>(
+    db: &'a AsyncMutex<magpie_core::rusqlite::Connection>,
+    interrupt: &magpie_core::rusqlite::InterruptHandle,
+    gen: &AtomicU64,
+) -> Option<tokio::sync::MutexGuard<'a, magpie_core::rusqlite::Connection>> {
+    let ticket = gen.fetch_add(1, Ordering::SeqCst) + 1;
+    interrupt.interrupt();
+    let conn = db.lock().await;
+    if gen.load(Ordering::SeqCst) != ticket {
+        return None;
+    }
+    Some(conn)
+}
+
+/// [`take_search_conn`] with the pieces pulled out of the app state.
+async fn take_state_search_conn(
+    state: &AppState,
+) -> Option<tokio::sync::MutexGuard<'_, magpie_core::rusqlite::Connection>> {
+    take_search_conn(&state.search_db, &state.search_interrupt, &state.search_gen).await
+}
+
+// ---------- commands ----------
+
+#[tauri::command]
+async fn search_stars(
+    state: State<'_, AppState>,
+    query: String,
+    sort: Option<search::RepoSort>,
+    limit: Option<usize>,
+) -> Result<Vec<SearchResult>, String> {
+    let sort = sort.unwrap_or(search::RepoSort::Relevance);
+    let limit = limit.unwrap_or(30).min(100);
+    let qvec = if query.trim().is_empty() {
+        None
+    } else {
+        let emb = state.embedder.clone();
+        let q = query.clone();
+        // try_lock: while a bulk embed pass holds the model, degrade to
+        // keyword-only instead of stalling every keystroke behind the lock
+        tokio::task::spawn_blocking(move || {
+            emb.try_lock()
+                .ok()
+                .and_then(|mut guard| guard.as_mut().map(|e| e.embed_query(&q)))
+        })
+        .await
+        .map_err(err_str)?
+        .transpose()
+        .map_err(err_str)?
+    };
+    let Some(conn) = take_state_search_conn(&state).await else {
+        return Ok(Vec::new()); // superseded; the frontend drops stale answers
+    };
+    let store = state.store.lock().unwrap();
+    rank_stars(&conn, &store, &query, qvec.as_deref(), sort, limit).map_err(err_str)
+}
+
+/// Repo hits as the palette ranks them: hybrid search, then a frecency edge
+/// for repos the user actually opens (relevance sort only). Shared with the
+/// MCP server so an assistant sees the same order the user does.
+fn rank_stars(
+    conn: &magpie_core::rusqlite::Connection,
+    store: &VectorStore,
+    query: &str,
+    qvec: Option<&[f32]>,
+    sort: search::RepoSort,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let mut hits = search::search(conn, store, query, qvec, sort, limit)?;
+    if matches!(sort, search::RepoSort::Relevance) {
+        let f = magpie_core::frecency::factors(conn, "repo", unix_now())?;
+        magpie_core::frecency::boost(
+            &mut hits,
+            &f,
+            0.01,
+            |h| h.repo.id.to_string(),
+            |h| h.score,
+            |h, s| h.score = s,
+        );
+    }
+    Ok(hits)
+}
+
+/// Backend halves of a settings snapshot: exportable meta keys. The GitHub
+/// token is deliberately NEVER exported.
+const EXPORTABLE_META: &[&str] = &[
+    "app_aliases",
+    "video_indexing",
+    "video_decode_threads",
+    "video_hwaccel",
+    "ui_lang",
+    "clipboard_enabled",
+    "clip_retention_days",
+    "clip_max_entries",
+    "max_file_mb",
+    "hf_endpoint",
+    "ocr_enabled",
+    "ocr_model",
+    "ocr_pdf",
+    "skip_worktrees",
+    "index_threads",
+    "sleep_index_enabled",
+    "watch_enabled",
+    "rescan_minutes",
+    "term_notify",
+    magpie_core::semantic::META_KEY,
+    magpie_core::edit::META_KEY,
+    magpie_core::workspace::META_KEY,
+    magpie_core::scripts::META_KEY,
+    magpie_core::pins::META_KEY,
+];
+
+/// Write a settings snapshot (backend meta + the frontend's localStorage
+/// half, passed in) to a JSON file the user picked.
+#[tauri::command]
+async fn export_settings(
+    state: State<'_, AppState>,
+    path: String,
+    frontend: serde_json::Value,
+) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    let mut meta = serde_json::Map::new();
+    for key in EXPORTABLE_META {
+        if let Some(v) = db::meta_get(&conn, key).map_err(err_str)? {
+            meta.insert((*key).into(), serde_json::Value::String(v));
+        }
+    }
+    let doc = json!({ "magpie_settings": 1, "meta": meta, "frontend": frontend });
+    std::fs::write(&path, serde_json::to_string_pretty(&doc).map_err(err_str)?).map_err(err_str)?;
+    Ok(())
+}
+
+/// Read a snapshot back: apply the meta half here, hand the frontend half
+/// back for localStorage. Unknown keys are ignored; the token can't sneak in.
+#[tauri::command]
+async fn import_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    let raw = std::fs::read_to_string(&path).map_err(err_str)?;
+    let doc: serde_json::Value = serde_json::from_str(&raw).map_err(err_str)?;
+    if doc.get("magpie_settings").and_then(|v| v.as_i64()) != Some(1) {
+        return Err("not a magpie settings file".into());
+    }
+    let mut imported: Vec<&str> = Vec::new();
+    {
+        let conn = state.db.lock().await;
+        if let Some(meta) = doc.get("meta").and_then(|m| m.as_object()) {
+            for key in EXPORTABLE_META {
+                if let Some(v) = meta.get(*key).and_then(|v| v.as_str()) {
+                    db::meta_set(&conn, key, v).map_err(err_str)?;
+                    imported.push(key);
+                }
+            }
+        }
+    }
+    // side effects that read meta live: aliases re-attach, tray language,
+    // OCR spin-up if the imported settings enable it
+    spawn_app_scan(app.clone());
+    if let Ok(conn) = db::open(&state.db_path) {
+        if let Ok(Some(lang)) = db::meta_get(&conn, "ui_lang") {
+            let _ = refresh_tray_menu(&app, &lang);
+        }
+        if let Ok(Some(v)) = db::meta_get(&conn, "ocr_enabled") {
+            if v == "1" {
+                spawn_ocr_init(app.clone());
+            }
+        }
+    }
+    // an imported thread cap applies to the loaded models now, as the
+    // settings row does; an imported worktree rule needs a rescan
+    if imported.contains(&"index_threads") {
+        apply_index_threads(&app, state.inner());
+    }
+    if imported.contains(&"skip_worktrees") {
+        spawn_local_index(app.clone());
+    }
+    // semantic search on or off takes effect as the settings switch does
+    if imported.contains(&magpie_core::semantic::META_KEY) {
+        let on = semantic_choice(&state) == magpie_core::semantic::Choice::On;
+        let app2 = app.clone();
+        tauri::async_runtime::spawn_blocking(move || apply_semantic(&app2, on));
+    }
+    Ok(doc.get("frontend").cloned().unwrap_or(json!({})))
+}
+
+/// The user opened a hit — feed the frecency stats (stable identity per
+/// kind: path / url / target / repo id).
+// async: opens the database; nothing of that belongs on the main thread
+#[tauri::command(async)]
+fn record_hit_use(state: State<'_, AppState>, kind: String, key: String) -> Result<(), String> {
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    magpie_core::frecency::record_use(&conn, &kind, &key, unix_now()).map_err(err_str)
+}
+
+#[tauri::command]
+async fn get_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let conn = state.db.lock().await;
+    let count = db::repo_count(&conn).map_err(err_str)?;
+    let file_count = files::file_count(&conn).map_err(err_str)?;
+    let folder_count = files::folder_count(&conn).map_err(err_str)?;
+    let bookmark_count = bookmarks::bookmark_count(&conn).map_err(err_str)?;
+    let history_count = history::history_count(&conn).map_err(err_str)?;
+    let clip_count = clips::clip_count(&conn).map_err(err_str)?;
+    let clip_retention_days = db::meta_get(&conn, "clip_retention_days")
+        .map_err(err_str)?
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(30);
+    let clip_max_entries = db::meta_get(&conn, "clip_max_entries")
+        .map_err(err_str)?
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let last_sync = db::meta_get(&conn, "last_sync").map_err(err_str)?;
+    let username = db::meta_get(&conn, "username").map_err(err_str)?;
+    let has_token = db::meta_get(&conn, "token").map_err(err_str)?.is_some();
+    let embedded = db::repo_chunk_hashes(&conn).map_err(err_str)?.len();
+    let max_file_mb = db::meta_get(&conn, "max_file_mb")
+        .map_err(err_str)?
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(files::DEFAULT_MAX_FILE_MB);
+    let hotkey = db::meta_get(&conn, "hotkey")
+        .map_err(err_str)?
+        .unwrap_or_else(|| DEFAULT_HOTKEY.to_string());
+    let hf_endpoint = db::meta_get(&conn, "hf_endpoint")
+        .map_err(err_str)?
+        .unwrap_or_else(|| "https://huggingface.co".to_string());
+    // MCP server: the switch, the live state, and the command to paste
+    let mcp_enabled = db::meta_get(&conn, "mcp_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let mcp_status = state.mcp_status.lock().unwrap().clone();
+    // file watcher and the reconciliation walk behind it
+    let watch_enabled = db::meta_get(&conn, "watch_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let watch_status = state.watch_status.lock().unwrap().clone();
+    let watched_folders = state.watched_folders.load(Ordering::SeqCst);
+    let rescan_every = db::meta_get(&conn, "rescan_minutes")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RESCAN_MINUTES);
+    let mcp_port = state.mcp.lock().unwrap().as_ref().map(|s| s.port);
+    let mcp_url = mcp_port.map(mcp::url).unwrap_or_default();
+    let mcp_command = match (mcp_port, db::meta_get(&conn, "mcp_token").ok().flatten()) {
+        (Some(p), Some(t)) => mcp::client_command(p, &t),
+        _ => String::new(),
+    };
+    Ok(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "parallel_test": option_env!("LOCALSEARCH_PARALLEL_TEST").is_some(),
+        "repo_count": count,
+        "file_count": file_count,
+        "folder_count": folder_count,
+        "bookmark_count": bookmark_count,
+        "history_count": history_count,
+        "clip_count": clip_count,
+        "clipboard_enabled": state.clip_watch.load(Ordering::SeqCst),
+        "clip_retention_days": clip_retention_days,
+        "clip_max_entries": clip_max_entries,
+        "app_aliases": db::meta_get(&conn, "app_aliases").map_err(err_str)?.unwrap_or_default(),
+        "app_folders": db::meta_get(&conn, "app_folders")
+            .map_err(err_str)?
+            .map(|t| magpie_core::apps::parse_app_folders(&t))
+            .unwrap_or_default(),
+        "video_count": magpie_core::videos::video_count(&conn).map_err(err_str)?,
+        "video_shot_count": magpie_core::videos::shot_count(&conn).map_err(err_str)?,
+        "video_indexing_enabled": db::meta_get(&conn, "video_indexing")
+            .map_err(err_str)?
+            .map(|v| v != "0")
+            .unwrap_or(true),
+        "video_indexing": state.video_indexing.load(Ordering::SeqCst),
+        "video_note": state.video_note.lock().unwrap().clone(),
+        "ffmpeg_status": state.ffmpeg_status.lock().unwrap().clone(),
+        "video_decode_threads": db::meta_get(&conn, "video_decode_threads")
+            .map_err(err_str)?
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(2),
+        "video_hwaccel": db::meta_get(&conn, "video_hwaccel")
+            .map_err(err_str)?
+            .map(|v| v == "1")
+            .unwrap_or(false),
+        "max_file_mb": max_file_mb,
+        "hotkey": hotkey,
+        "hotkey_selection": resolve_selection_hotkey(db::meta_get(&conn, "hotkey_selection").ok().flatten().as_deref()).unwrap_or_default(),
+        "hotkey_selection_default": DEFAULT_SELECTION_HOTKEY,
+        "skip_worktrees": db::meta_get(&conn, "skip_worktrees").ok().flatten().map(|v| v != "0").unwrap_or(true),
+        "index_threads": magpie_core::threads::displayed(magpie_core::threads::setting(&conn), magpie_core::threads::cores()),
+        "sleep_index_enabled": db::meta_get(&conn, "sleep_index_enabled")
+            .map_err(err_str)?.as_deref() == Some("1"),
+        "sleep_index_active": state.sleep_hold_active.load(Ordering::SeqCst),
+        "cpu_cores": magpie_core::threads::cores(),
+        "mcp_enabled": mcp_enabled,
+        "mcp_status": mcp_status,
+        "mcp_url": mcp_url,
+        "mcp_command": mcp_command,
+        "watch_enabled": watch_enabled,
+        "watch_status": watch_status,
+        "watched_folders": watched_folders,
+        "rescan_minutes": rescan_every,
+        "note_path": note_path_from(&conn, &state.db_path).to_string_lossy().into_owned(),
+        "hf_endpoint": hf_endpoint,
+        "embedded_count": embedded,
+        "last_sync": last_sync,
+        "username": username,
+        "has_token": has_token,
+        "model": state.model_status.lock().unwrap().clone(),
+        "semantic": magpie_core::semantic::choice(&conn, &state.model_dir)
+            .map(|c| c.as_str())
+            .unwrap_or("on"),
+        "semantic_paused": state.models_paused.load(Ordering::SeqCst),
+        // which models sit in memory right now (a busy lock counts as yes)
+        "text_model_loaded": state.embedder.try_lock().map(|g| g.is_some()).unwrap_or(true),
+        "image_model_loaded": state.siglip.try_lock().map(|g| g.is_some()).unwrap_or(true),
+        // a load in flight: it cannot be cut short, it finishes and is dropped
+        "text_model_loading": state.model_initing.load(Ordering::SeqCst),
+        "image_model_loading": state.siglip_initing.load(Ordering::SeqCst),
+        "image_model": state.siglip_status.lock().unwrap().clone(),
+        "ocr_enabled": db::meta_get(&conn, "ocr_enabled")
+            .map_err(err_str)?
+            .map(|v| v == "1")
+            .unwrap_or(false),
+        "ocr_model": db::meta_get(&conn, "ocr_model")
+            .map_err(err_str)?
+            .unwrap_or_else(|| magpie_core::ocr::OCR_MODEL_ID.into()),
+        "ocr_status": state.ocr_status.lock().unwrap().clone(),
+        "ocr_pdf": db::meta_get(&conn, "ocr_pdf")
+            .map_err(err_str)?
+            .map(|v| v == "1")
+            .unwrap_or(false),
+        "term_notify": term_notify_on(&conn),
+        "window_corners": WINDOW_CORNERS.get().copied(),
+        // Wayland: how the summon key is bound (None elsewhere)
+        "wayland_hotkey": wayland_hotkey::status(),
+        // the tips on the empty box join in on the first day of a term
+        "term_today": term_notify_on(&conn)
+            .then(|| magpie_core::chinese_calendar::term_of_day(magpie_core::chinese_calendar::local_now().date()))
+            .flatten()
+            .map(|t| json!({ "term": t.term, "line": t.line, "source": t.source })),
+        "term_notified": db::meta_get(&conn, "term_notified").map_err(err_str)?.unwrap_or_default(),
+        "syncing": state.sync_running.load(Ordering::SeqCst),
+        "local_indexing": state.local_indexing.load(Ordering::SeqCst),
+    }))
+}
+
+#[tauri::command]
+async fn set_token(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<String, String> {
+    let client = GithubClient::new(&token).map_err(err_str)?;
+    let login = client.viewer_login().await.map_err(err_str)?;
+    {
+        let conn = state.db.lock().await;
+        db::meta_set(&conn, "token", token.trim()).map_err(err_str)?;
+        db::meta_set(&conn, "username", &login).map_err(err_str)?;
+    }
+    // first token → kick off initial sync immediately
+    spawn_sync(app);
+    Ok(login)
+}
+
+/// Forget the GitHub token and everything synced with it (issue #6).
+#[tauri::command]
+async fn disconnect_github(state: State<'_, AppState>) -> Result<(), String> {
+    // hold the sync flag while forgetting: a sync that started in between
+    // would have read the old token and written the stars back
+    if state.sync_running.swap(true, Ordering::SeqCst) {
+        return Err("sync is running; try again when it finishes".into());
+    }
+    let forgotten = {
+        let mut conn = state.db.lock().await;
+        db::forget_github(&mut conn).map_err(err_str)
+    };
+    state.sync_running.store(false, Ordering::SeqCst);
+    forgotten?;
+    reload_store(&state.db_path, &state.store);
+    log::info!("github disconnected");
+    Ok(())
+}
+
+#[tauri::command]
+fn start_sync(app: AppHandle) -> Result<(), String> {
+    spawn_sync(app);
+    Ok(())
+}
+
+#[tauri::command]
+fn open_repo(app: AppHandle, url: String) -> Result<(), String> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("only http(s) urls".into());
+    }
+    open_web(&app, &url, "a result or a web search")
+}
+
+// ---------- local files ----------
+
+#[tauri::command]
+async fn search_local(
+    state: State<'_, AppState>,
+    query: String,
+    scope: Option<search::LocalScope>,
+    limit: Option<usize>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let scope = scope.unwrap_or(search::LocalScope::All);
+    let limit = limit.unwrap_or(30).min(100);
+    let started = std::time::Instant::now();
+    // test hook: a slow file search, to check the palette shows apps first
+    if let Some(ms) = std::env::var("MAGPIE_TEST_SLOW_LOCAL_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+    // embed the words, not the filter tokens: "ext:pdf invoice" should land
+    // near "invoice" in vector space, and search_files strips the same
+    // tokens again for the keyword side
+    let (_, raw_text) = magpie_core::filters::parse(&query);
+    let text = search::normalize_local_query_text(&raw_text);
+    // Visual multilingual bridge uses an EN query ONLY when the dictionary
+    // covers the meaningful Russian words. Unknown descriptions retain the
+    // original SigLIP path. No cloud translation and no index mutation.
+    let visual_pivot = visual_english_pivot(&text);
+    let (qvec, image_qvec, pivot_qvec, text_ms, image_ms) = if text.trim().is_empty() {
+        (None, None, None, 0, 0)
+    } else {
+        let emb = state.embedder.clone();
+        let sig = state.siglip.clone();
+        let q = text.clone();
+        let pivot = visual_pivot.clone();
+        // try_lock: while a bulk embed pass holds a model, degrade that vector
+        // list instead of stalling every keystroke behind the lock
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let t0 = std::time::Instant::now();
+            let text = emb
+                .try_lock()
+                .ok()
+                .and_then(|mut g| g.as_mut().map(|e| e.embed_query(&q)))
+                .transpose()?;
+            let t1 = std::time::Instant::now();
+            // A background visual indexing pass may hold the SigLIP lock.
+            // Wait a bounded period rather than silently treating an image
+            // description as a text-only query on the first try_lock miss.
+            let mut image = None;
+            let mut visual_pivot_vector = None;
+            for attempt in 0..12 {
+                if let Ok(mut guard) = sig.try_lock() {
+                    if let Some(model) = guard.as_mut() {
+                        image = Some(model.embed_query(&q)?);
+                        if let Some(ref english) = pivot {
+                            visual_pivot_vector = Some(model.embed_query(english)?);
+                        }
+                    }
+                    break;
+                }
+                if attempt != 11 { std::thread::sleep(std::time::Duration::from_millis(25)); }
+            }
+            Ok((text, image, visual_pivot_vector, (t1 - t0).as_millis(), t1.elapsed().as_millis()))
+        })
+        .await
+        .map_err(err_str)?
+        .map_err(err_str)?
+    };
+    let embedded_at = std::time::Instant::now();
+    let Some(conn) = take_state_search_conn(&state).await else {
+        return Ok(Vec::new()); // superseded; the frontend drops stale answers
+    };
+    let ranked_at = std::time::Instant::now();
+    let store = state.store.lock().unwrap();
+    let store_lock_ms = ranked_at.elapsed().as_millis();
+    let hits = rank_local_bilingual(&conn, &store, &query, qvec.as_deref(),
+        image_qvec.as_deref(), visual_pivot.as_deref().zip(pivot_qvec.as_deref()),
+        scope, limit).map_err(err_str);
+    // a slow file search is logged with where the time went, so a report
+    // from a machine we cannot test on shows it (queries themselves are not)
+    let total = started.elapsed().as_millis();
+    if total > 150 {
+        log::info!(
+            "slow file search: {total} ms (text model {text_ms} ms, image model {image_ms} ms, waiting {} ms, ranking {} ms, store lock {store_lock_ms} ms)",
+            (ranked_at - embedded_at).as_millis(),
+            ranked_at.elapsed().as_millis()
+        );
+    }
+    if WORK_SAFE {
+        let hits_len = hits.as_ref().map(|items| items.len()).unwrap_or_default();
+        log::info!("WORK_SEARCH_TIMING total_ms={total} embedding_text_ms={text_ms} embedding_image_ms={image_ms} ranking_ms={} hits={hits_len}", ranked_at.elapsed().as_millis());
+    }
+    hits
+}
+
+/// Local hits as the palette ranks them. The videos scope is its own
+/// pipeline (filename + semantic shots, fused); files get a frecency edge on
+/// real queries. Shared with the MCP server.
+fn rank_local(
+    conn: &magpie_core::rusqlite::Connection,
+    store: &VectorStore,
+    query: &str,
+    qvec: Option<&[f32]>,
+    image_qvec: Option<&[f32]>,
+    scope: search::LocalScope,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    if matches!(scope, search::LocalScope::Videos) {
+        let vids = search::search_videos_scope(conn, store, query, image_qvec, limit)?;
+        return Ok(tag_hits(Vec::new(), vids, false));
+    }
+    let mut files = search::search_files(conn, store, query, qvec, image_qvec, scope, limit)?;
+    if !query.trim().is_empty() {
+        let f = magpie_core::frecency::factors(conn, "file", unix_now())?;
+        magpie_core::frecency::boost(
+            &mut files,
+            &f,
+            0.01,
+            |h| h.path.clone(),
+            |h| h.score,
+            |h, s| h.score = s,
+        );
+    }
+    // Frecency can reorder results, so restore the strict joint evidence tier.
+    search::sort_joint_address_first(&mut files);
+    // The "All" scope must search *shots*, not just documents. Search_files
+    // already returns filename/OCR matches, but never the semantic moments
+    // from search_videos_scope. Always use the SAME SigLIP query vector.
+    if matches!(scope, search::LocalScope::All)
+        && !query.trim().is_empty() && image_qvec.is_some()
+    {
+        if visual_query_intent(query) {
+            // Keep image candidates independent of document-pool truncation.
+            // Only fuse ranks across text vs vision; cosine stays within SigLIP.
+            let visual = visual_expansion_hits(conn, store, query, image_qvec.unwrap(), scope, limit)?;
+            return Ok(rrf_merge_visual(tag_hits(files, Vec::new(), false), visual, limit));
+        }
+        // Nonvisual document queries keep RC9's file ranking. A weak visual
+        // vector must not insert unrelated video scenes between exact documents.
+    }
+    Ok(tag_hits(files, Vec::new(), false))
+}
+
+const VISUAL_TERMS: &[(&str, &str)] = &[
+        ("девуш", "woman"),("женщин", "woman"),("мужчин", "man"),("парен", "man"),
+        ("мальчик", "boy"),("девочк", "girl"),("ребен", "child"),("ребён", "child"),
+        ("дет", "children"),("человек", "person"),("люд", "people"),
+        ("собак", "dog"),("кошк", "cat"),("кот", "cat"),("птиц", "bird"),
+        ("лошад", "horse"),("цвет", "flower"),("дерев", "tree"),
+        ("короб", "box"),("подар", "gift"),("пакет", "bag"),("корзин", "basket"),
+        ("орех", "nuts"),("фрукт", "fruit"),("яблок", "apple"),("бутыл", "bottle"),
+        ("стул", "chair"),("крес", "armchair"),("диван", "sofa"),("стол", "table"),
+        ("шкаф", "cabinet"),("кроват", "bed"),("ламп", "lamp"),("окн", "window"),
+        ("двер", "door"),("книг", "book"),("телефон", "phone"),("ноутбук", "laptop"),
+        ("машин", "car"),("автомоб", "car"),("велосип", "bicycle"),("автобус", "bus"),
+        ("дорог", "road"),("улиц", "street"),("дом", "house"),("здан", "building"),
+        ("пляж", "beach"),("мор", "sea"),("лес", "forest"),("кухн", "kitchen"),
+        ("комнат", "room"),("коф", "coffee"),("ед", "food"),("торт", "cake"),
+        ("красн", "red"),("зел", "green"),("син", "blue"),("голуб", "blue"),
+        ("желт", "yellow"),("жёлт", "yellow"),("черн", "black"),("чёрн", "black"),
+        ("бел", "white"),("коричнев", "brown"),("розов", "pink"),("сер", "gray"),
+        ("оранжев", "orange"),("фиолет", "purple"),("деревян", "wooden"),
+        ("металличес", "metal"),("стеклян", "glass"),("больш", "large"),("малень", "small"),
+        ("держ", "holding"),("нес", "carrying"),("сид", "sitting"),("сто", "standing"),
+        ("леж", "lying"),("беж", "running"),("ид", "walking"),("обним", "hugging"),
+        ("смотр", "looking"),("улыба", "smiling"),("открыва", "opening"),
+        ("закрыва", "closing"),("ест", "eating"),("пь", "drinking"),
+    ];
+
+/// Conservative scene-description gate. Unknown words, identifiers and negation
+/// keep the existing document route; both languages share the visual vocabulary.
+fn visual_query_intent(query: &str) -> bool {
+    let (_, text) = magpie_core::filters::parse(query);
+    let text = search::normalize_local_query_text(&text);
+    if text.chars().any(|c| c.is_numeric()) { return false; }
+    if visual_english_pivot(&text).is_some() { return true; }
+    let mut recognized = 0;
+    for word in text.split(|c: char| !c.is_alphabetic()).filter(|w| !w.is_empty()) {
+        let word = word.to_lowercase();
+        if matches!(word.as_str(), "a"|"an"|"the"|"of"|"with"|"on"|"in"|"at"|"and"|"photo"|"image"|"picture"|"video") { continue; }
+        if !VISUAL_TERMS.iter().any(|(_, en)| *en == word) { return false; }
+        recognized += 1;
+    }
+    recognized >= 2
+}
+
+/// Grounded offline visual query pivot. This is NOT a general translator:
+/// use only if enough visual terms are recognized, otherwise leave the original
+/// Russian embedding alone. No proper names, numbers or identifiers are altered.
+fn visual_english_pivot(query: &str) -> Option<String> {
+    let words: Vec<String> = query.to_lowercase().split(|c: char| !c.is_alphabetic())
+        .filter(|w| !w.is_empty()).map(str::to_owned).collect();
+    if words.is_empty() || !words.iter().any(|w| w.chars().any(|c| ('а'..='я').contains(&c) || c=='ё')) {
+        return None;
+    }
+    let mut output = Vec::<&'static str>::new();
+    let mut meaningful = 0usize;
+    let mut covered = 0usize;
+    // Deliberately restricted to *visual* content, rather than a document
+    // or general-purpose translator. Entries have common Russian inflections.
+    for w in &words {
+        if matches!(w.as_str(), "с"|"со"|"и"|"на"|"в"|"во"|"у"|"около"|"перед"|"за"|"рядом"|"видео"|"фото"|"фотографии"|"кадр"|"кадре"|"изображении"|"изображение"|"где"|"который"|"которая"|"которое") {
+            continue;
+        }
+        meaningful += 1;
+        if let Some((_, english)) = VISUAL_TERMS.iter().find(|(stem, _)| w.starts_with(stem)) {
+            covered += 1;
+            if output.last() != Some(english) {output.push(*english);}
+        }
+    }
+    // Do not turn partial/ambiguous technical or legal requests into photos.
+    if covered < 2 || covered != meaningful {return None;}
+    Some(format!("a photo of {}",output.join(" ")))
+}
+
+/// Run the original Russian retrieval unmodified, then a second visual-only
+/// English-pivot pass where coverage is high. Combines two independently
+/// ranked results by reciprocal rank rather than comparing incompatible
+/// similarity scales. All vector data stay on this machine.
+mod decision_search;
+fn rank_local_bilingual(conn: &magpie_core::rusqlite::Connection, store: &VectorStore, query: &str, qvec: Option<&[f32]>, image_qvec: Option<&[f32]>, pivot: Option<(&str, &[f32])>, scope: search::LocalScope, limit: usize) -> Result<Vec<serde_json::Value>> {
+    if search::decision::enabled() { decision_search::rank(conn,store,query,qvec,image_qvec,pivot,scope,limit) }
+    else { rank_local_bilingual_legacy(conn,store,query,qvec,image_qvec,pivot,scope,limit) }
+}
+
+fn rank_local_bilingual_legacy(
+    conn: &magpie_core::rusqlite::Connection,
+    store: &VectorStore,
+    query: &str,
+    qvec: Option<&[f32]>,
+    image_qvec: Option<&[f32]>,
+    pivot: Option<(&str, &[f32])>,
+    scope: search::LocalScope,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let baseline = rank_local(conn,store,query,qvec,image_qvec,scope,limit)?;
+    if matches!(scope, search::LocalScope::Text) { return Ok(baseline); }
+    let Some((_, vector)) = pivot else {return Ok(baseline);};
+    let additional = visual_expansion_hits(conn, store, query, vector, scope, limit)?;
+    // In Images scope a short machine-translated description is an auxiliary
+    // retrieval signal, not a reason to evict strong original-language hits.
+    // Keep the native top-3 *set* and let the bilingual RRF order those three.
+    // Outside that anchor group, bilingual candidates remain eligible normally.
+    // All-scope intentionally has no anchor: a relevant image must be able to
+    // climb above text-document hits.
+    if matches!(scope, search::LocalScope::Images) {
+        let fused = rrf_merge_visual(baseline.clone(),additional,limit);
+        return Ok(preserve_visual_anchors(&baseline,fused,limit,3));
+    }
+    Ok(rrf_merge_visual(baseline,additional,limit))
+}
+
+/// The translated description supplies visual evidence only. Images and video
+/// shots use the SAME SigLIP space, so compare their cosine scores directly.
+/// Apply original filters before truncation; do not give filenames a second vote.
+fn visual_expansion_hits(
+    conn: &magpie_core::rusqlite::Connection,
+    store: &VectorStore,
+    query: &str,
+    vector: &[f32],
+    scope: search::LocalScope,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let (filters, text) = magpie_core::filters::parse(query);
+    // An explicit video request adds shot candidates, not competing photos.
+    // The baseline still searches all file types; explicit UI scope wins.
+    let video_requested = matches!(scope, search::LocalScope::All)
+        && text.to_lowercase().split(|c: char| !c.is_alphabetic())
+            .any(|word| matches!(word, "video" | "videos" | "видео"));
+    // One metadata scan, no blobs and no per-video queries. Materialize only
+    // the top matching results, even when a filter excludes the global top-k.
+    let allowed = if filters.is_empty() { None } else {
+        let now = unix_now();
+        let mut stmt = conn.prepare_cached("SELECT id, ext, size, mtime, path FROM files")?;
+        let mut rows = stmt.query([])?;
+        let mut ids = std::collections::HashSet::new();
+        while let Some(row) = rows.next()? {
+            let ext: Option<String> = row.get(1)?;
+            let path: String = row.get(4)?;
+            if filters.matches(ext.as_deref(), row.get(2)?, row.get(3)?, &path, now) {
+                ids.insert(row.get::<_, i64>(0)?);
+            }
+        }
+        Some(ids)
+    };
+    let files = if !video_requested && matches!(scope, search::LocalScope::All | search::LocalScope::Images) {
+        search::search_images_filtered(conn, store, vector, limit, allowed.as_ref())?
+    } else { Vec::new() };
+    let videos = if matches!(scope, search::LocalScope::All | search::LocalScope::Videos) {
+        search::search_video_shots_filtered(conn, store, vector, limit, allowed.as_ref())?
+    } else { Vec::new() };
+    let mut rows = tag_hits(files, videos, true);
+    rows.truncate(limit);
+    Ok(rows)
+}
+
+/// Keep proven native Top-K image candidates within the first K positions
+/// after a short/possibly lossy local RU->EN expansion. This operates on
+/// file paths only; never uses target names, labels or gold judgments.
+/// The bilingual RRF can still reorder the anchor group and the tail.
+fn preserve_visual_anchors(
+    baseline: &[serde_json::Value],
+    fused: Vec<serde_json::Value>,
+    limit: usize,
+    max_anchors: usize,
+) -> Vec<serde_json::Value> {
+    use std::collections::HashSet;
+    let k = baseline.len().min(limit).min(max_anchors);
+    if k == 0 { return fused.into_iter().take(limit).collect(); }
+    let anchor_paths: HashSet<&str> = baseline.iter().take(k)
+        .filter_map(|v| v.get("path").and_then(|p| p.as_str()))
+        .collect();
+    let mut anchors = Vec::new();
+    let mut other = Vec::new();
+    let mut emitted = HashSet::<String>::new();
+    for hit in fused {
+        let Some(path) = hit.get("path").and_then(|p| p.as_str()) else { continue; };
+        let path = path.to_owned();
+        if !emitted.insert(path.clone()) { continue; }
+        if anchor_paths.contains(path.as_str()) { anchors.push(hit); }
+        else { other.push(hit); }
+    }
+    // In small-limit calls a strong native hit can have been truncated by
+    // the expansion. Reinsert it rather than losing it silently.
+    for hit in baseline.iter().take(k) {
+        if let Some(path) = hit.get("path").and_then(|p| p.as_str()) {
+            if emitted.insert(path.to_owned()) { anchors.push(hit.clone()); }
+        }
+    }
+    anchors.extend(other);
+    anchors.truncate(limit);
+    anchors
+}
+
+/// One local file may occur in files and video results; retain the shot with
+/// a valid time range. Avoid ranking by incompatible raw BM25 and cosine scores.
+/// Score is preserved for UI; an independent 'visual_rrf' diagnostic is added.
+fn rrf_merge_visual(
+    primary: Vec<serde_json::Value>, secondary: Vec<serde_json::Value>, limit: usize,
+) -> Vec<serde_json::Value> {
+    use std::collections::HashMap;
+    let mut unique = HashMap::<String, (serde_json::Value,f64,usize)>::new();
+    for (source, hits) in [primary,secondary].into_iter().enumerate() {
+        let mut in_source = std::collections::HashSet::<String>::new();
+        for (rank,hit) in hits.into_iter().enumerate() {
+            let path=hit.get("path").and_then(|v|v.as_str()).unwrap_or("");
+            if path.is_empty() || !in_source.insert(path.to_owned()) {continue;}
+            let key=path.to_owned();
+            let points=1.0f64 / (60.0 + (rank+1) as f64);
+            let entry=unique.entry(key).or_insert_with(|| (hit.clone(),0.0,source*100_000+rank));
+            entry.1+=points;
+            let valid_shot=|v:&serde_json::Value| {
+                v.get("end_ms").and_then(|x|x.as_i64()).unwrap_or(0) >
+                v.get("start_ms").and_then(|x|x.as_i64()).unwrap_or(0)
+            };
+            if valid_shot(&hit) && !valid_shot(&entry.0) {entry.0=hit;}
+        }
+    }
+    let mut ranked:Vec<_>=unique.into_values().collect();
+    ranked.sort_by(|a,b|b.1.total_cmp(&a.1).then_with(||a.2.cmp(&b.2)));
+    ranked.into_iter().take(limit).map(|(mut hit,score,_)| {
+        hit["visual_rrf"]=serde_json::json!(score);
+        hit
+    }).collect()
+}
+
+/// Fuse independent file and video rankings; no fixed 2-files/1-video quota.
+fn interleave_visual_hits(
+    files: Vec<serde_json::Value>, videos: Vec<serde_json::Value>, limit: usize,
+) -> Vec<serde_json::Value> {
+    if videos.is_empty() {return files.into_iter().take(limit).collect();}
+    rrf_merge_visual(files,videos,limit)
+}
+
+#[cfg(test)]
+mod localsearch_beta3_visual_tests {
+    use super::*;
+    fn paths(v:Vec<serde_json::Value>)->Vec<String>{v.into_iter().map(|r|r["path"].as_str().unwrap().to_owned()).collect()}
+    #[test]
+    fn pivot_is_visual_and_has_coverage_gate() {
+        assert_eq!(visual_english_pivot("девушка держит подарочную коробку").as_deref(),
+           Some("a photo of woman holding gift box"));
+        assert_eq!(visual_english_pivot("зелёный стул на видео").as_deref(),
+           Some("a photo of green chair"));
+        assert_eq!(visual_english_pivot("корзина с орехами").as_deref(),
+           Some("a photo of basket nuts"));
+        assert_eq!(visual_english_pivot("счёт-фактура № АБ-302/25"),None);
+        assert_eq!(visual_english_pivot("договор Семёнова от 5 апреля"),None);
+        assert_eq!(visual_english_pivot("девушка не держит коробку"),None);
+        assert_eq!(visual_english_pivot("красный стул в незнакомой комнате будущего"),None);
+        assert_eq!(visual_english_pivot("a green chair"),None);
+    }
+    #[test]
+    fn bilingual_rank_evidence_promotes_repeated_image_not_single_video() {
+        let first=vec![
+            serde_json::json!({"kind":"file","path":"/other.jpg"}),
+            serde_json::json!({"kind":"file","path":"/woman.png"}),
+            serde_json::json!({"kind":"file","path":"/foo.pdf"})];
+        let second=vec![serde_json::json!({"kind":"file","path":"/woman.png"})];
+        let got=rrf_merge_visual(first,second,10);
+        assert_eq!(got[0]["path"],"/woman.png");
+        assert!(got[0]["visual_rrf"].as_f64().unwrap()>got[1]["visual_rrf"].as_f64().unwrap());
+    }
+    #[test]
+    fn unique_originals_and_shot_timestamp_survive_fusion() {
+        let files=vec![serde_json::json!({"kind":"file","path":"/clip.mov"}),
+                       serde_json::json!({"kind":"file","path":"/doc.pdf"})];
+        let vids=vec![serde_json::json!({"kind":"video","path":"/clip.mov","start_ms":100,"end_ms":1000})];
+        let got=rrf_merge_visual(files,vids,10);
+        assert_eq!(paths(got.clone()),vec!["/clip.mov","/doc.pdf"]);
+        assert_eq!(got[0]["kind"],"video");
+        assert_eq!(got[0]["start_ms"],100);
+    }
+    #[test]
+    fn short_translation_preserves_native_visual_top_three() {
+        let baseline = vec![
+            serde_json::json!({"kind":"file","path":"/a.png"}),
+            serde_json::json!({"kind":"file","path":"/b.png"}),
+            serde_json::json!({"kind":"file","path":"/c.png"}),
+            serde_json::json!({"kind":"file","path":"/d.png"})];
+        let translation = vec![
+            serde_json::json!({"kind":"file","path":"/d.png"}),
+            serde_json::json!({"kind":"file","path":"/x.png"}),
+            serde_json::json!({"kind":"file","path":"/b.png"}),
+            serde_json::json!({"kind":"file","path":"/c.png"})];
+        let candidate = rrf_merge_visual(baseline.clone(),translation,10);
+        let guarded = preserve_visual_anchors(&baseline,candidate,10,3);
+        let first3: std::collections::HashSet<_> = guarded.iter().take(3)
+            .filter_map(|r|r.get("path").and_then(|v|v.as_str())).collect();
+        assert_eq!(first3.len(),3);
+        for p in ["/a.png","/b.png","/c.png"] {assert!(first3.contains(p));}
+        assert_eq!(guarded.len(),5,"bilingual candidates beyond the anchors remain eligible");
+    }
+    #[test]
+    fn short_translation_preserves_original_when_fusion_truncates() {
+        let baseline = vec![
+            serde_json::json!({"kind":"file","path":"/a.png"}),
+            serde_json::json!({"kind":"file","path":"/b.png"}),
+            serde_json::json!({"kind":"file","path":"/c.png"})];
+        let fused=vec![
+            serde_json::json!({"kind":"file","path":"/external.png"}),
+            serde_json::json!({"kind":"file","path":"/b.png"})];
+        let result=preserve_visual_anchors(&baseline,fused,3,3);
+        let paths=paths(result);
+        assert_eq!(paths.len(),3);
+        assert!(paths.contains(&"/a.png".to_owned()));
+        assert!(paths.contains(&"/b.png".to_owned()));
+        assert!(paths.contains(&"/c.png".to_owned()));
+    }
+    #[test]
+    fn nonvisual_exact_query_leaves_lexical_rank_untouched() {
+        assert!(visual_english_pivot("КП 123-456 Лаптиев 2026").is_none());
+        let files=vec![serde_json::json!({"kind":"file","path":"/original.docx"})];
+        assert_eq!(interleave_visual_hits(files.clone(),vec![],10), files);
+    }
+}
+
+#[cfg(test)]
+mod localsearch_beta2_visual_merge_tests {
+    use super::*;
+    #[test]
+    fn all_scope_interleaves_video_without_score_mix_or_duplicates() {
+        let files = (0..7).map(|n| serde_json::json!({
+            "kind":"file", "path": format!("/d{n}.txt"), "score": 99.0
+        })).collect::<Vec<_>>();
+        let vids = vec![
+            serde_json::json!({"kind":"video","path":"/chair.mov","score":0.01,"start_ms":1000,"end_ms":2000}),
+            serde_json::json!({"kind":"video","path":"/d0.txt","score":0.02,"start_ms":0,"end_ms":0}),
+        ];
+        let got = interleave_visual_hits(files,vids,6);
+        assert_eq!(got.len(),6);
+        assert_eq!(got[0]["path"],"/d0.txt");
+        assert_eq!(got[1]["path"],"/chair.mov");
+        assert_eq!(got.iter().filter(|x| x["path"]=="/d0.txt").count(),1);
+    }
+    #[test]
+    fn timestamped_video_wins_over_its_duplicate_plain_file() {
+        let files = vec![serde_json::json!({"kind":"file","path":"/clip.mov"})];
+        let vids = vec![serde_json::json!({"kind":"video","path":"/clip.mov","start_ms":500,"end_ms":700})];
+        let result=interleave_visual_hits(files,vids,3);
+        assert_eq!(result.len(),1);
+        assert_eq!(result[0]["kind"],"video");
+    }
+    #[test]
+    fn no_visual_candidates_leave_files_unmodified() {
+        let files=vec![serde_json::json!({"kind":"file","path":"/a.pdf"})];
+        let out=interleave_visual_hits(files,vec![],10);
+        assert_eq!(out.len(),1);
+        assert_eq!(out[0]["path"],"/a.pdf");
+    }
+}
+
+/// Tag file/video hits with their kind for the frontend's mixed result list.
+fn tag_hits(
+    files: Vec<FileHit>,
+    videos: Vec<magpie_core::videos::VideoHit>,
+    interleave_by_score: bool,
+) -> Vec<serde_json::Value> {
+    let mut tagged: Vec<(f32, serde_json::Value)> = Vec::new();
+    for f in files {
+        let s = f.score;
+        let mut v = serde_json::to_value(&f).unwrap_or_default();
+        v["kind"] = serde_json::Value::from("file");
+        tagged.push((s, v));
+    }
+    let file_count = tagged.len();
+    for h in videos {
+        let s = h.score;
+        let mut v = serde_json::to_value(&h).unwrap_or_default();
+        v["kind"] = serde_json::Value::from("video");
+        tagged.push((s, v));
+    }
+    if interleave_by_score {
+        // image queries: both lists are cosine similarities — comparable
+        tagged.sort_by(|a, b| b.0.total_cmp(&a.0));
+    } else {
+        // text queries: hybrid file scores and cosine shot scores live on
+        // different scales — videos append after files instead
+        let _ = file_count;
+    }
+    tagged.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Search indexed images with a query image: a dropped file (`path`) or
+/// pasted clipboard bytes (`bytes_b64`). The query image itself does not need
+/// to be inside an indexed folder — it is only embedded, never stored.
+/// Video shots share the SigLIP space, so matching videos rank in the same
+/// list with the exact time range of the best-matching shot.
+#[tauri::command]
+async fn search_by_image(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: Option<String>,
+    bytes_b64: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let limit = limit.unwrap_or(30).min(100);
+    if semantic_choice(&state) != magpie_core::semantic::Choice::On {
+        return Err("searching by image needs semantic search; turn it on in settings".into());
+    }
+    if state.models_paused.load(Ordering::SeqCst) {
+        return Err("semantic search is paused; resume it in the tray menu or settings".into());
+    }
+    if *state.siglip_status.lock().unwrap() == IMAGE_MODEL_IDLE {
+        // idle means no image, video or image clip is indexed, so there is
+        // nothing to match against; if that just changed, start the load
+        if !ensure_image_model(&app) {
+            return Ok(Vec::new());
+        }
+        return Err("image model not ready yet".into());
+    }
+    let sig = state.siglip.clone();
+    let qvec = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
+        let mut guard = sig
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("image model is busy indexing, try again shortly"))?;
+        let s = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("image model not ready yet"))?;
+        match (path, bytes_b64) {
+            (Some(p), _) => s.embed_image(std::path::Path::new(&p)),
+            (None, Some(b64)) => {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("bad image data: {e}"))?;
+                s.embed_image_bytes(&bytes)
+            }
+            (None, None) => Err(anyhow::anyhow!("no image given")),
+        }
+    })
+    .await
+    .map_err(err_str)?
+    .map_err(err_str)?;
+
+    let conn = state.db.lock().await;
+    let store = state.store.lock().unwrap();
+    let files = search::search_images(&conn, &store, &qvec, limit).map_err(err_str)?;
+    let vids = search::search_video_shots(&conn, &store, &qvec, 8).map_err(err_str)?;
+    Ok(tag_hits(files, vids, true))
+}
+
+/// Thumbnail of a query image for the input-row chip. Read-only, never stored.
+// async: decodes an image from disk, off the main thread
+#[tauri::command(async)]
+fn preview_thumb(path: String) -> Result<Option<String>, String> {
+    Ok(files::thumb_b64_for(std::path::Path::new(&path)))
+}
+
+/// The part of `text` the preview shows: 2400 bytes, starting a little above
+/// the first match of `query` when there is one. Also whether text was left
+/// out before and after. `whole_lines` widens the start and narrows the end
+/// to line breaks, so a list never shows half a name at either edge.
+fn text_window<'a>(text: &'a str, query: Option<&str>, whole_lines: bool) -> (&'a str, bool, bool) {
+    let lower = text.to_lowercase();
+    let q = query.unwrap_or_default().trim().to_lowercase();
+    let hit = if q.is_empty() { None } else { lower.find(&q) };
+    let mut start = match hit {
+        Some(pos) if pos > 400 => {
+            // walk back to a char boundary near pos-400
+            let mut s = (pos - 400).min(text.len());
+            while s > 0 && !text.is_char_boundary(s) {
+                s -= 1;
+            }
+            s
+        }
+        _ => 0,
+    };
+    if whole_lines {
+        start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    }
+    let mut end = (start + 2400).min(text.len());
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    if whole_lines && end < text.len() {
+        // keep the matched line whole even when it runs past the window
+        // (`hit` counts in the lowercased text; snap onto a char of `text`)
+        let mut keep = hit.map_or(start, |pos| pos + q.len()).clamp(start, end);
+        while !text.is_char_boundary(keep) {
+            keep += 1;
+        }
+        if let Some(i) = text[keep..end].rfind('\n') {
+            end = keep + i;
+        } else if let Some(i) = text[end..].find('\n') {
+            end += i;
+        } else {
+            end = text.len();
+        }
+    }
+    (&text[start..end], start > 0, end < text.len())
+}
+
+/// Content for the preview pane. Everything comes from the local index (file
+/// text, repo metadata, video shots) or the file on disk (large image) — no
+/// network. `query` centres a text preview on its first match.
+#[tauri::command]
+async fn get_preview(
+    state: State<'_, AppState>,
+    kind: String,
+    id: i64,
+    query: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let conn = state.db.lock().await;
+    match kind.as_str() {
+        "file" => {
+            let (path, ext, content): (String, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT path, ext, content FROM files WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(err_str)?;
+            if magpie_core::videos::is_video_ext(ext.as_deref()) {
+                // a video found by name (the "all" scope lists it as a file):
+                // its shots when the video index has them, else one frame
+                let shots = shots_json(&conn, id).map_err(err_str)?;
+                if !shots.is_empty() {
+                    return Ok(json!({ "kind": "shots", "shots": shots }));
+                }
+                let (decode, duration) = video_poster_inputs(&conn, id);
+                drop(conn); // decoding takes a moment; nobody waits on the db for it
+                return Ok(video_poster(&state.model_dir, path, decode, duration).await);
+            }
+            if files::is_image_ext(ext.as_deref()) {
+                // large preview rendered fresh from disk (index only keeps 96px)
+                let b64 = tokio::task::spawn_blocking(move || {
+                    files::preview_b64_for(std::path::Path::new(&path), 560)
+                })
+                .await
+                .map_err(err_str)?;
+                return Ok(json!({ "kind": "image", "image": b64 }));
+            }
+            if ext.as_deref().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
+                // what the zip holds, read fresh from its central directory:
+                // the names (the matched one in view), how many files in all,
+                // and whether they need a password
+                drop(conn);
+                let z = tokio::task::spawn_blocking(move || {
+                    files::zip_contents(std::path::Path::new(&path), files::ARCHIVE_LIST_CAP)
+                })
+                .await
+                .map_err(err_str)?;
+                let Some(z) = z else { return Ok(json!({ "kind": "none" })) };
+                let (text, clipped_head, clipped_tail) = text_window(&z.names, query.as_deref(), true);
+                return Ok(json!({
+                    "kind": "archive",
+                    "files": z.files,
+                    "encrypted": z.encrypted,
+                    "text": text,
+                    "clipped_head": clipped_head,
+                    "clipped_tail": clipped_tail || z.names.lines().count() < z.files,
+                }));
+            }
+            let text = content.unwrap_or_default();
+            if text.is_empty() {
+                return Ok(json!({ "kind": "none" }));
+            }
+            let (text, clipped_head, clipped_tail) = text_window(&text, query.as_deref(), false);
+            Ok(json!({
+                "kind": "text",
+                "text": text,
+                "clipped_head": clipped_head,
+                "clipped_tail": clipped_tail,
+            }))
+        }
+        "clip" => {
+            // image clips: the stored full-size JPEG; text clips carry their
+            // content in the hit already
+            match clips::image_clip_jpeg(&conn, id).map_err(err_str)? {
+                Some(jpeg) => {
+                    use base64::Engine;
+                    Ok(json!({
+                        "kind": "image",
+                        "image": base64::engine::general_purpose::STANDARD.encode(jpeg),
+                    }))
+                }
+                None => Ok(json!({ "kind": "none" })),
+            }
+        }
+        "video" => {
+            let shots = shots_json(&conn, id).map_err(err_str)?;
+            if !shots.is_empty() {
+                return Ok(json!({ "kind": "shots", "shots": shots }));
+            }
+            // a filename match on a video the index has not reached yet
+            let path: Option<String> = conn
+                .query_row("SELECT path FROM files WHERE id = ?1", [id], |r| r.get(0))
+                .ok();
+            let Some(path) = path else {
+                return Ok(json!({ "kind": "none" }));
+            };
+            let (decode, duration) = video_poster_inputs(&conn, id);
+            drop(conn);
+            Ok(video_poster(&state.model_dir, path, decode, duration).await)
+        }
+        "repo" => {
+            let row = conn
+                .query_row(
+                    "SELECT description, topics, homepage, starred_at,
+                            substr(COALESCE(readme, ''), 1, 2400), length(COALESCE(readme, ''))
+                     FROM repos WHERE id = ?1",
+                    [id],
+                    |r| {
+                        Ok(json!({
+                            "kind": "repo",
+                            "description": r.get::<_, Option<String>>(0)?,
+                            "topics": r.get::<_, Option<String>>(1)?,
+                            "homepage": r.get::<_, Option<String>>(2)?,
+                            "starred_at": r.get::<_, Option<String>>(3)?,
+                            "readme": r.get::<_, String>(4)?,
+                            "readme_clipped": r.get::<_, i64>(5)? > 2400,
+                        }))
+                    },
+                )
+                .map_err(err_str)?;
+            Ok(row)
+        }
+        _ => Ok(json!({ "kind": "none" })),
+    }
+}
+
+/// A video's indexed shots for the preview pane, in order (at most 60).
+fn shots_json(conn: &magpie_core::rusqlite::Connection, file_id: i64) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT start_ms, end_ms, ts_ms, thumb FROM video_shots
+         WHERE file_id = ?1 ORDER BY start_ms LIMIT 60",
+    )?;
+    let shots = stmt
+        .query_map([file_id], |r| {
+            Ok(json!({
+                "start_ms": r.get::<_, i64>(0)?,
+                "end_ms": r.get::<_, i64>(1)?,
+                "ts_ms": r.get::<_, i64>(2)?,
+                "thumb": r.get::<_, Option<String>>(3)?,
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(shots)
+}
+
+/// Decode settings and the known duration (0 = unknown) for a poster frame.
+fn video_poster_inputs(
+    conn: &magpie_core::rusqlite::Connection,
+    file_id: i64,
+) -> (magpie_core::videos::DecodeOpts, i64) {
+    let duration = conn
+        .query_row("SELECT duration_ms FROM video_index WHERE file_id = ?1", [file_id], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_or(0);
+    (decode_opts_from_meta(conn), duration)
+}
+
+/// Width of a poster frame, the same as the large image preview.
+const POSTER_WIDTH: u32 = 560;
+
+/// One frame of a video for the preview pane, when an ffmpeg is already at
+/// hand (on PATH or unpacked by an earlier video pass). A preview never
+/// starts the ffmpeg download: that stays with the video index. Without one,
+/// or when the file will not decode, the pane falls back to file details.
+async fn video_poster(
+    model_dir: &Path,
+    path: String,
+    decode: magpie_core::videos::DecodeOpts,
+    duration_ms: i64,
+) -> serde_json::Value {
+    let model_dir = model_dir.to_path_buf();
+    let frame = tokio::task::spawn_blocking(move || -> Option<String> {
+        if !magpie_core::videos::ffmpeg_available(&model_dir) {
+            return None;
+        }
+        magpie_core::videos::poster_b64(&path, duration_ms, decode, POSTER_WIDTH)
+            .map_err(|e| log::info!("no poster frame for a video: {e}"))
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    match frame {
+        Some(b64) => json!({ "kind": "image", "image": b64 }),
+        None => json!({ "kind": "none" }),
+    }
+}
+
+// ---------- settings ----------
+
+const DEFAULT_HOTKEY: &str = "Alt+Space";
+
+/// Change the file-size cap (MB, 0 = unlimited) and rebuild the local index:
+/// mtime-based increments would miss files the old cap truncated or skipped.
+#[tauri::command]
+async fn set_max_file_mb(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mb: u64,
+) -> Result<(), String> {
+    if state.local_indexing.load(Ordering::SeqCst) {
+        return Err("indexing is running; try again when it finishes".into());
+    }
+    {
+        let conn = state.db.lock().await;
+        db::meta_set(&conn, "max_file_mb", &mb.to_string()).map_err(err_str)?;
+        conn.execute("DELETE FROM files", []).map_err(err_str)?;
+    }
+    spawn_local_index(app);
+    Ok(())
+}
+
+/// The selection-search chord out of the box. A sibling of Alt+Space that no
+/// OS claims: Ctrl+Alt+Space is free on Windows and Linux (JetBrains binds it
+/// inside the IDE; rebindable here), while on macOS Ctrl+Option+Space is the
+/// system's input-source switch, so Option+Shift+Space instead.
+#[cfg(target_os = "macos")]
+const DEFAULT_SELECTION_HOTKEY: &str = "Alt+Shift+Space";
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_SELECTION_HOTKEY: &str = "Ctrl+Alt+Space";
+
+/// Stored preference → chord to register. Nothing stored means the default;
+/// an empty string is the user having removed it; anything else is theirs.
+fn resolve_selection_hotkey(stored: Option<&str>) -> Option<String> {
+    match stored {
+        None => Some(DEFAULT_SELECTION_HOTKEY.to_string()),
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(s.trim().to_string()),
+    }
+}
+
+/// (Re)register every global chord: the summon toggle, and optionally the
+/// selection search. One function because the plugin's `unregister_all` is
+/// the only reliable way to drop a stale chord, so both have to be re-added
+/// together whenever either changes.
+fn register_hotkeys(app: &AppHandle, summon: &str, selection: Option<&str>) -> Result<(), String> {
+    // Isolated test edition never captures shortcuts owned by working RC9.
+    if option_env!("LOCALSEARCH_PARALLEL_TEST").is_some() {
+        return Err("Горячие клавиши выключены в тестовой версии".into());
+    }
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+    let gs = app.global_shortcut();
+    gs.unregister_all().map_err(err_str)?;
+    gs.on_shortcut(summon, |app, _sc, event| {
+        if event.state() == ShortcutState::Pressed {
+            toggle_window(app, "summon key");
+        }
+    })
+    .map_err(err_str)?;
+    if let Some(sel) = selection.map(str::trim).filter(|s| !s.is_empty()) {
+        gs.on_shortcut(sel, |app, _sc, event| {
+            if event.state() == ShortcutState::Pressed {
+                search_selection(app.clone());
+            }
+        })
+        .map_err(err_str)?;
+    }
+    Ok(())
+}
+
+/// Look up whatever is selected in the frontmost app: synthesize the copy
+/// chord, read the clipboard back, summon the palette with that as the
+/// query. If the clipboard did not change, nothing was selected — summon
+/// with an empty box rather than searching a stale clip.
+///
+/// The log gets how it went (timings, lengths, never the text), since a
+/// selection search that comes back empty looks the same whatever the cause.
+fn search_selection(app: AppHandle) {
+    use magpie_core::selection;
+    use std::time::{Duration, Instant};
+    tauri::async_runtime::spawn(async move {
+        // macOS drops synthesized keys without the Accessibility permission;
+        // say so instead of opening an empty box as if nothing was selected.
+        // The palette carries the hint and a button to the settings page:
+        // macOS's own prompt opened underneath the palette (#17)
+        if !selection::input_allowed() {
+            log::warn!("selection search: no Accessibility permission");
+            let _ = app.emit("selection-needs-access", ());
+            show_window(&app);
+            return;
+        }
+        // the chord goes out once the hotkey's modifiers are up: sent while
+        // Option+Shift are still held, ⌘C arrives as ⌥⇧⌘C and copies nothing
+        let start = Instant::now();
+        while selection::modifiers_held() && start.elapsed() < Duration::from_millis(1500) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let released = start.elapsed().as_millis();
+        let still_held = selection::modifiers_held();
+        let seq_before = selection::clipboard_seq();
+        let before = clips::clipboard_text().ok();
+        if let Err(e) = send_mod_chord(&app, 'c').await {
+            log::warn!("selection search: could not synthesize the copy chord: {e}");
+        }
+        // wait for the front app to write the clipboard: some take well over
+        // the 160 ms once allowed. With a change counter the wait ends at the
+        // write; without one, at a changed text
+        let sent = Instant::now();
+        let mut seq_after = seq_before;
+        let mut after = before.clone();
+        while sent.elapsed() < Duration::from_millis(800) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            seq_after = selection::clipboard_seq();
+            if seq_before.is_some() && seq_after.is_some() {
+                if seq_after != seq_before {
+                    // the writer may still hold the clipboard open
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    after = clips::clipboard_text().ok();
+                    if after.is_none() {
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        after = clips::clipboard_text().ok();
+                    }
+                    break;
+                }
+            } else {
+                after = clips::clipboard_text().ok();
+                if after.is_some() && after != before {
+                    break;
+                }
+            }
+        }
+        let waited = sent.elapsed().as_millis();
+        let query = selection::copied_query(
+            (seq_before, seq_after),
+            before.as_deref(),
+            after.as_deref(),
+        );
+        if query.is_empty() {
+            log::info!(
+                "selection search: nothing copied after {waited} ms (modifiers up after {released} ms{}; clipboard counter {:?} -> {:?})",
+                if still_held { ", still held" } else { "" },
+                seq_before,
+                seq_after
+            );
+        } else {
+            log::info!(
+                "selection search: copied {} chars in {waited} ms (modifiers up after {released} ms)",
+                query.chars().count()
+            );
+        }
+        let _ = app.emit("search-selection", query);
+        show_window(&app);
+    });
+}
+
+/// Switch the model download endpoint (e.g. hf-mirror.com for regions where
+/// huggingface.co is unreachable). Retries any failed model init immediately.
+#[tauri::command]
+async fn set_hf_endpoint(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    endpoint: String,
+) -> Result<(), String> {
+    let endpoint = endpoint.trim().trim_end_matches('/').to_string();
+    if !endpoint.starts_with("https://") {
+        return Err("endpoint must be an https:// URL".into());
+    }
+    {
+        let conn = state.db.lock().await;
+        db::meta_set(&conn, "hf_endpoint", &endpoint).map_err(err_str)?;
+    }
+    std::env::set_var("HF_ENDPOINT", &endpoint);
+    // retry model init unless the model is already usable. If an init is
+    // still running (e.g. wedged against the old endpoint), the spawn guard
+    // skips and the reinit flag queues one fresh attempt for when it ends.
+    if *state.model_status.lock().unwrap() != "ready" {
+        state.model_reinit.store(true, Ordering::SeqCst);
+        spawn_model_init(app.clone());
+    }
+    // an idle image model has nothing to do yet; it loads, from the new
+    // endpoint, once something needs it
+    let image = state.siglip_status.lock().unwrap().clone();
+    if image != "ready" && image != IMAGE_MODEL_IDLE {
+        state.siglip_reinit.store(true, Ordering::SeqCst);
+        spawn_siglip_init(app);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_hotkey(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    hotkey: String,
+) -> Result<(), String> {
+    let hotkey = hotkey.trim().to_string();
+    if hotkey.is_empty() {
+        return Err("empty shortcut".into());
+    }
+    let (previous, selection) = {
+        let conn = state.db.lock().await;
+        (
+            db::meta_get(&conn, "hotkey")
+                .map_err(err_str)?
+                .unwrap_or_else(|| DEFAULT_HOTKEY.to_string()),
+            resolve_selection_hotkey(db::meta_get(&conn, "hotkey_selection").map_err(err_str)?.as_deref()),
+        )
+    };
+    if let Err(e) = register_hotkeys(&app, &hotkey, selection.as_deref()) {
+        // keep the old chord working instead of leaving nothing registered
+        let _ = register_hotkeys(&app, &previous, selection.as_deref());
+        return Err(format!("cannot register {hotkey:?}: {e}"));
+    }
+    {
+        let conn = state.db.lock().await;
+        db::meta_set(&conn, "hotkey", &hotkey).map_err(err_str)?;
+    }
+    // on Wayland the desktop holds the key: rebind it there too, before
+    // returning, so Settings reads the new state
+    #[cfg(target_os = "linux")]
+    {
+        let key = hotkey.clone();
+        let _ = tokio::task::spawn_blocking(move || wayland_hotkey::apply(&key)).await;
+    }
+    Ok(())
+}
+
+/// Set (or clear, with an empty string) the chord that searches the current
+/// selection. Registered alongside the summon chord.
+#[tauri::command]
+async fn set_selection_hotkey(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    hotkey: String,
+) -> Result<(), String> {
+    let hotkey = hotkey.trim().to_string();
+    let (summon, previous) = {
+        let conn = state.db.lock().await;
+        (
+            db::meta_get(&conn, "hotkey")
+                .map_err(err_str)?
+                .unwrap_or_else(|| DEFAULT_HOTKEY.to_string()),
+            resolve_selection_hotkey(db::meta_get(&conn, "hotkey_selection").map_err(err_str)?.as_deref()),
+        )
+    };
+    if hotkey == summon {
+        return Err("that chord already summons the palette".into());
+    }
+    let wanted = (!hotkey.is_empty()).then_some(hotkey.as_str());
+    if let Err(e) = register_hotkeys(&app, &summon, wanted) {
+        let _ = register_hotkeys(&app, &summon, previous.as_deref());
+        return Err(format!("cannot register {hotkey:?}: {e}"));
+    }
+    let conn = state.db.lock().await;
+    db::meta_set(&conn, "hotkey_selection", &hotkey).map_err(err_str)?;
+    Ok(())
+}
+
+/// The notes file: the user's choice, or notes.md next to the database.
+fn note_path_from(conn: &magpie_core::rusqlite::Connection, db_path: &std::path::Path) -> PathBuf {
+    db::meta_get(conn, "note_path")
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            magpie_core::notes::default_path(db_path.parent().unwrap_or(std::path::Path::new(".")))
+        })
+}
+
+/// `note buy milk` → one timestamped line appended to the notes file.
+/// Returns the file it wrote to, for the confirmation row.
+#[tauri::command]
+async fn append_note(state: State<'_, AppState>, text: String) -> Result<String, String> {
+    let path = {
+        let conn = state.db.lock().await;
+        note_path_from(&conn, &state.db_path)
+    };
+    magpie_core::notes::append(&path, &text).map_err(err_str)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Choose the notes file; an empty path goes back to the default. Returns the
+/// path now in effect.
+#[tauri::command]
+async fn set_note_path(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    let conn = state.db.lock().await;
+    db::meta_set(&conn, "note_path", path.trim()).map_err(err_str)?;
+    Ok(note_path_from(&conn, &state.db_path).to_string_lossy().into_owned())
+}
+
+/// Open the notes file in whatever handles markdown; created empty if it does
+/// not exist yet, so the click always lands somewhere.
+#[tauri::command]
+async fn open_note_file(state: State<'_, AppState>) -> Result<(), String> {
+    let path = {
+        let conn = state.db.lock().await;
+        note_path_from(&conn, &state.db_path)
+    };
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(err_str)?;
+        }
+        std::fs::write(&path, "").map_err(err_str)?;
+    }
+    open_default(&path, "the note file")
+}
+
+/// How far back a file's last change still counts as recent for the empty
+/// box: a week covers "the thing I saved on Monday".
+const CHANGED_WITHIN_SECS: i64 = 7 * 86_400;
+
+/// What the user opened most recently from one source tab, newest first.
+/// Backs the empty-query list when that setting is on. Identities come from
+/// hit_stats and are resolved back into full rows; anything since deleted or
+/// uninstalled simply drops out. The local tab also lists files in the
+/// indexed folders that changed lately (saved, downloaded, screenshotted),
+/// whether or not they were ever opened through magpie.
+#[tauri::command]
+async fn recent_hits(
+    state: State<'_, AppState>,
+    source: String,
+    limit: Option<usize>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let limit = limit.unwrap_or(12).min(50);
+    let kinds: &[&str] = match source.as_str() {
+        "local" => &["file", "video", "app"],
+        "github-stars" => &["repo"],
+        "web" => &["bookmark", "history"],
+        _ => return Ok(Vec::new()),
+    };
+    let Some(conn) = take_state_search_conn(&state).await else {
+        return Ok(Vec::new());
+    };
+    let apps = state.apps.lock().unwrap();
+    let opened = recent_rows_timed(&conn, &apps, kinds, limit).map_err(err_str)?;
+    if source != "local" {
+        return Ok(opened.into_iter().map(|(_, _, v)| v).collect());
+    }
+    let now = unix_now();
+    let changed = files::changed_between(&conn, now - CHANGED_WITHIN_SECS, now + 300, limit)
+        .map_err(err_str)?
+        .into_iter()
+        .filter_map(|(t, f)| {
+            let path = f.path.clone();
+            let mut v = serde_json::to_value(&f).ok()?;
+            v["kind"] = serde_json::Value::from("file");
+            Some((t, path, v))
+        })
+        .collect();
+    Ok(magpie_core::frecency::blend(opened, changed, limit))
+}
+
+/// The rows behind the most recently opened hits of the given kinds, newest
+/// first, tagged for the mixed result list. Shared with the MCP server.
+fn recent_rows(
+    conn: &magpie_core::rusqlite::Connection,
+    apps: &[magpie_core::apps::AppEntry],
+    kinds: &[&str],
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    Ok(recent_rows_timed(conn, apps, kinds, limit)?.into_iter().map(|(_, _, v)| v).collect())
+}
+
+/// `recent_rows` with each row's last_used time and identity, for blending.
+fn recent_rows_timed(
+    conn: &magpie_core::rusqlite::Connection,
+    apps: &[magpie_core::apps::AppEntry],
+    kinds: &[&str],
+    limit: usize,
+) -> Result<Vec<(i64, String, serde_json::Value)>> {
+    let keys = magpie_core::frecency::recent(conn, kinds, limit * 2)?;
+    let mut out = Vec::with_capacity(limit);
+    for (kind, key, last_used) in keys {
+        if let Some(v) = hit_row(conn, apps, &kind, &key)? {
+            out.push((last_used, key, v));
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One result row from a stable identity (the hit_stats kinds and keys:
+/// file/video → path, app → target, repo → id, bookmark/history → url),
+/// tagged for the mixed list. None when it no longer exists.
+fn hit_row(
+    conn: &magpie_core::rusqlite::Connection,
+    apps: &[magpie_core::apps::AppEntry],
+    kind: &str,
+    key: &str,
+) -> Result<Option<serde_json::Value>> {
+    let tag = |mut v: serde_json::Value, kind: &str| {
+        v["kind"] = serde_json::Value::from(kind);
+        if v.get("score").is_none() {
+            v["score"] = serde_json::Value::from(0.0);
+        }
+        v
+    };
+    Ok(match kind {
+        // a video opened from a shot comes back as its file row: the shot
+        // itself is not a stable identity, the path is
+        "file" | "video" => files::file_by_path(conn, key)?
+            .and_then(|f| serde_json::to_value(&f).ok())
+            .map(|v| tag(v, "file")),
+        "app" => apps
+            .iter()
+            .find(|a| a.target == key)
+            .and_then(|a| serde_json::to_value(a).ok())
+            .map(|v| tag(v, "app")),
+        "repo" => key
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| db::repos_by_ids(conn, &[id]).ok())
+            .and_then(|mut r| r.pop())
+            .and_then(|r| serde_json::to_value(&r).ok())
+            .map(|v| tag(v, "repo")),
+        "bookmark" => bookmarks::bookmark_by_url(conn, key)?
+            .and_then(|b| serde_json::to_value(&b).ok())
+            .map(|v| tag(v, "bookmark")),
+        "history" => history::history_by_url(conn, key)?
+            .and_then(|h| serde_json::to_value(&h).ok())
+            .map(|v| tag(v, "history")),
+        _ => None,
+    })
+}
+
+/// The daily recall card (recall.rs) as a result row, with `recall` saying
+/// why it is there. Days are local: `MAGPIE_TEST_NOW` stands in for the
+/// clock, as for the solar-term reminder. On the main connection: it writes
+/// the day's choice, and the search connection's ticket would cancel the
+/// recent list asked for at the same moment.
+#[tauri::command]
+async fn recall_today(state: State<'_, AppState>, source: String) -> Result<Vec<serde_json::Value>, String> {
+    // each tab its own kind (#13): bookmarks on Web, repos on Stars, both
+    // on the local tab, which every summon opens on
+    let kinds: &[&str] = match source.as_str() {
+        "local" => &["bookmark", "repo"],
+        "web" => &["bookmark"],
+        "github-stars" => &["repo"],
+        _ => &[],
+    };
+    let conn = state.db.lock().await;
+    let (day, now, tz) = magpie_core::recall::local_clock();
+    let mut out = Vec::new();
+    for kind in kinds {
+        let Some(pick) = magpie_core::recall::today(&conn, kind, day, now, tz).map_err(err_str)? else { continue };
+        let row = {
+            let apps = state.apps.lock().unwrap();
+            hit_row(&conn, &apps, &pick.kind, &pick.key).map_err(err_str)?
+        };
+        if let Some(mut row) = row {
+            row["recall"] = serde_json::to_value(&pick.why).map_err(err_str)?;
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+// ---------- script commands (scripts.rs) ----------
+
+/// The scripts folder: the one picked in settings, else `scripts` next to
+/// the index.
+fn scripts_dir(conn: &magpie_core::rusqlite::Connection, db_path: &Path) -> PathBuf {
+    db::meta_get(conn, magpie_core::scripts::META_KEY)
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| db_path.parent().unwrap_or(Path::new(".")).join("scripts"))
+}
+
+async fn current_scripts_dir(state: &AppState) -> PathBuf {
+    let conn = state.db.lock().await;
+    scripts_dir(&conn, &state.db_path)
+}
+
+#[tauri::command]
+async fn search_scripts(state: State<'_, AppState>, query: String) -> Result<Vec<magpie_core::scripts::Match>, String> {
+    let dir = current_scripts_dir(&state).await;
+    tokio::task::spawn_blocking(move || magpie_core::scripts::matches(&magpie_core::scripts::list(&dir), &query))
+        .await
+        .map_err(err_str)
+}
+
+/// Run one script from the folder with these arguments. Only a script the
+/// folder lists runs: the path is looked up there, never taken as given.
+#[tauri::command]
+async fn run_script(
+    state: State<'_, AppState>,
+    path: String,
+    given: Vec<String>,
+) -> Result<magpie_core::scripts::Output, String> {
+    let dir = current_scripts_dir(&state).await;
+    tokio::task::spawn_blocking(move || {
+        let script = magpie_core::scripts::list(&dir)
+            .into_iter()
+            .find(|s| s.path == path)
+            .ok_or("that script is not in the scripts folder")?;
+        magpie_core::scripts::run(&script, &given, magpie_core::scripts::RUN_TIMEOUT).map_err(err_str)
+    })
+    .await
+    .map_err(err_str)?
+}
+
+#[derive(serde::Serialize)]
+struct ScriptsFolder {
+    dir: String,
+    /// the folder picked in settings, not the default one
+    custom: bool,
+    count: usize,
+}
+
+#[tauri::command]
+async fn scripts_folder(state: State<'_, AppState>) -> Result<ScriptsFolder, String> {
+    let (dir, custom) = {
+        let conn = state.db.lock().await;
+        let custom = db::meta_get(&conn, magpie_core::scripts::META_KEY).map_err(err_str)?.is_some_and(|s| !s.trim().is_empty());
+        (scripts_dir(&conn, &state.db_path), custom)
+    };
+    let d = dir.clone();
+    let count = tokio::task::spawn_blocking(move || magpie_core::scripts::list(&d).len()).await.map_err(err_str)?;
+    Ok(ScriptsFolder { dir: dir.to_string_lossy().into_owned(), custom, count })
+}
+
+/// Show the scripts folder; the default one is made on first use, with an
+/// example script in it.
+#[tauri::command]
+async fn open_scripts_folder(state: State<'_, AppState>) -> Result<(), String> {
+    let dir = current_scripts_dir(&state).await;
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(err_str)?;
+        let (name, body) = magpie_core::scripts::example();
+        std::fs::write(dir.join(name), body).map_err(err_str)?;
+    }
+    if open_dry_run() {
+        return Ok(());
+    }
+    open_default(&dir, "the scripts folder")
+}
+
+/// Pick another scripts folder (it must exist), or None for the default.
+#[tauri::command]
+async fn set_scripts_folder(state: State<'_, AppState>, dir: Option<String>) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    match dir.filter(|d| !d.trim().is_empty()) {
+        Some(d) => {
+            if !Path::new(&d).is_dir() {
+                return Err("not a folder".into());
+            }
+            db::meta_set(&conn, magpie_core::scripts::META_KEY, &d).map_err(err_str)
+        }
+        None => {
+            conn.execute("DELETE FROM meta WHERE key = ?1", [magpie_core::scripts::META_KEY]).map_err(err_str)?;
+            Ok(())
+        }
+    }
+}
+
+// ---------- workspaces (workspace.rs) ----------
+
+/// A workspace as a result row: its name, what is in it, the match score.
+#[derive(serde::Serialize)]
+struct WorkspaceHit {
+    #[serde(flatten)]
+    ws: magpie_core::workspace::Workspace,
+    score: f32,
+}
+
+#[tauri::command]
+async fn search_workspaces(state: State<'_, AppState>, query: String) -> Result<Vec<WorkspaceHit>, String> {
+    let conn = state.db.lock().await;
+    Ok(magpie_core::workspace::search(&conn, &query)
+        .map_err(err_str)?
+        .into_iter()
+        .map(|(ws, score)| WorkspaceHit { ws, score })
+        .collect())
+}
+
+#[tauri::command]
+async fn list_workspaces(state: State<'_, AppState>) -> Result<Vec<magpie_core::workspace::Workspace>, String> {
+    let conn = state.db.lock().await;
+    magpie_core::workspace::list(&conn).map_err(err_str)
+}
+
+#[tauri::command]
+async fn workspace_add(
+    state: State<'_, AppState>,
+    name: String,
+    item: magpie_core::workspace::Item,
+) -> Result<magpie_core::workspace::Workspace, String> {
+    let conn = state.db.lock().await;
+    magpie_core::workspace::add(&conn, &name, item, unix_now()).map_err(err_str)
+}
+
+#[tauri::command]
+async fn workspace_remove_item(state: State<'_, AppState>, name: String, kind: String, target: String) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    magpie_core::workspace::remove_item(&conn, &name, &kind, &target, unix_now()).map_err(err_str)
+}
+
+#[tauri::command]
+async fn workspace_delete(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    magpie_core::workspace::delete(&conn, &name).map_err(err_str)
+}
+
+/// Open everything in a workspace, in its order, by the same rules as
+/// opening each one alone: files only inside indexed folders and never a
+/// program, apps only while installed, pages only over http(s). One that
+/// cannot open does not stop the rest; the answer lists those (and, under
+/// `MAGPIE_OPEN_DRYRUN`, what would have opened). The palette goes away
+/// once everything opened.
+#[tauri::command]
+async fn open_workspace(app: AppHandle, state: State<'_, AppState>, name: String) -> Result<Vec<String>, String> {
+    let ws = {
+        let conn = state.db.lock().await;
+        magpie_core::workspace::list(&conn)
+            .map_err(err_str)?
+            .into_iter()
+            .find(|w| w.name.to_lowercase() == name.to_lowercase())
+            .ok_or("no such workspace")?
+    };
+    let dry = open_dry_run();
+    let mut report = Vec::new();
+    for item in &ws.items {
+        let t = item.target.as_str();
+        let outcome: Result<(), String> = match item.kind.as_str() {
+            "file" => {
+                let allowed = {
+                    let conn = state.db.lock().await;
+                    files::path_is_allowed(&conn, t).map_err(err_str)?
+                };
+                let ext = Path::new(t).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                if !allowed {
+                    Err("outside indexed folders".into())
+                } else if RUNNABLE_EXTS.contains(&ext.as_str()) {
+                    Err("a program, not opened from here".into())
+                } else if !Path::new(t).exists() {
+                    Err("no longer there".into())
+                } else if dry {
+                    Ok(())
+                } else {
+                    open_default(Path::new(t), "a workspace")
+                }
+            }
+            "app" => {
+                let installed = state.apps.lock().unwrap().iter().any(|a| a.target == t);
+                if !installed || !magpie_core::apps::target_exists(t) {
+                    Err("not installed".into())
+                } else if dry {
+                    Ok(())
+                } else {
+                    start_app(t, "a workspace")
+                }
+            }
+            "url" if t.starts_with("https://") || t.starts_with("http://") => {
+                if dry {
+                    Ok(())
+                } else {
+                    open_web(&app, t, "a workspace")
+                }
+            }
+            _ => Err("cannot be opened".into()),
+        };
+        match outcome {
+            Ok(()) if dry => report.push(format!("dry run: open {} {t}", item.kind)),
+            Ok(()) => {}
+            Err(e) => report.push(format!("{}: {e}", item.title)),
+        }
+    }
+    if report.is_empty() {
+        hide_palette(&app);
+    }
+    Ok(report)
+}
+
+// ---------- pinned folders (pins.rs) ----------
+
+#[tauri::command]
+async fn get_pinned_folders(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let conn = state.db.lock().await;
+    magpie_core::pins::list(&conn).map_err(err_str)
+}
+
+/// The whole list as the settings page has it now (added, removed, moved).
+#[tauri::command]
+async fn set_pinned_folders(state: State<'_, AppState>, paths: Vec<String>) -> Result<Vec<String>, String> {
+    let conn = state.db.lock().await;
+    magpie_core::pins::set(&conn, &paths).map_err(err_str)
+}
+
+/// The pinned folders that are still there, as rows for the local tab's
+/// empty box, in the user's order.
+#[tauri::command]
+async fn pinned_rows(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let pins = {
+        let conn = state.db.lock().await;
+        magpie_core::pins::list(&conn).map_err(err_str)?
+    };
+    Ok(pins
+        .into_iter()
+        .filter(|p| Path::new(p).is_dir())
+        .map(|p| {
+            let name = Path::new(&p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone());
+            json!({ "kind": "folder", "path": p, "name": name, "score": 0.0 })
+        })
+        .collect())
+}
+
+/// Open a pinned folder. Only a folder on the pinned list opens here: the
+/// pins are how a folder outside the indexed ones gets opened at all.
+#[tauri::command]
+async fn open_pinned_folder(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<String, String> {
+    let pinned = {
+        let conn = state.db.lock().await;
+        magpie_core::pins::is_pinned(&conn, &path).map_err(err_str)?
+    };
+    if !pinned || !Path::new(&path).is_dir() {
+        return Err("not a pinned folder".into());
+    }
+    if open_dry_run() {
+        return Ok(format!("dry run: open folder {path}"));
+    }
+    open_default(Path::new(&path), "a pinned folder")?;
+    hide_palette(&app);
+    Ok(String::new())
+}
+
+/// Today for the empty search box (#13): the date, the weekday (1 =
+/// Monday) and the Chinese-calendar day.
+/// The clock is the one tests set in `MAGPIE_TEST_NOW`, as for the recall
+/// card and the solar-term reminder.
+#[tauri::command]
+fn today_line() -> magpie_core::chinese_calendar::TodayLine {
+    magpie_core::chinese_calendar::today_line(magpie_core::chinese_calendar::local_now())
+}
+
+/// "Don't show this again" on the recall card.
+#[tauri::command]
+async fn recall_skip(state: State<'_, AppState>, kind: String, key: String) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    magpie_core::recall::skip(&conn, &kind, &key).map_err(err_str)
+}
+
+#[tauri::command]
+async fn list_folders(state: State<'_, AppState>) -> Result<Vec<FolderInfo>, String> {
+    let conn = state.db.lock().await;
+    files::list_folders(&conn).map_err(err_str)
+}
+
+/// Inventory generated exclusively from existing SQLite records. The connection is
+/// opened read-only on a blocking worker, independently of the indexing mutex.
+#[tauri::command]
+async fn indexed_sources(state: State<'_, AppState>) -> Result<magpie_core::index_sources::IndexSourcesReport, String> {
+    let db_path = state.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        use magpie_core::rusqlite::{Connection, OpenFlags};
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(db_path, flags).map_err(err_str)?;
+        conn.busy_timeout(std::time::Duration::from_secs(3)).map_err(err_str)?;
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+        let canonical_home = home.canonicalize().unwrap_or(home);
+        magpie_core::index_sources::report(&conn, &canonical_home).map_err(err_str)
+    }).await.map_err(err_str)?
+}
+
+#[tauri::command]
+async fn add_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<FolderInfo>, String> {
+    let out = {
+        let conn = state.db.lock().await;
+        files::add_folder(&conn, &path).map_err(err_str)?;
+        files::list_folders(&conn).map_err(err_str)?
+    };
+    rewatch(&app);
+    spawn_local_index(app);
+    Ok(out)
+}
+
+/// Expand an indexed root to cover all its subfolders atomically.
+/// The core implementation changes ownership only, keeping every file ID,
+/// indexed text and vector; it never calls destructive folder deletion.
+#[tauri::command]
+async fn consolidate_nested_folders(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<FolderInfo>, String> {
+    let folders = {
+        let conn = state.db.lock().await;
+        files::consolidate_nested_roots(&conn, &path).map_err(err_str)?;
+        files::list_folders(&conn).map_err(err_str)?
+    };
+    rewatch(&app);
+    spawn_local_index(app);
+    Ok(folders)
+}
+
+/// Several folders at once ("Add common places"): all are registered before
+/// the one index pass starts, so the scan takes them all in together and
+/// none waits for another's pass (embedding a big Downloads can take long).
+/// A folder that cannot be added is reported; the others still go in.
+#[tauri::command]
+async fn add_folders(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<(Vec<FolderInfo>, Vec<String>), String> {
+    let (out, failed) = {
+        let conn = state.db.lock().await;
+        let failed: Vec<String> = paths
+            .iter()
+            .filter_map(|p| files::add_folder(&conn, p).err().map(|e| format!("{p}: {e}")))
+            .collect();
+        (files::list_folders(&conn).map_err(err_str)?, failed)
+    };
+    rewatch(&app);
+    spawn_local_index(app);
+    Ok((out, failed))
+}
+
+/// One entry of the "Add common places" list.
+#[derive(serde::Serialize)]
+struct CommonPlace {
+    kind: &'static str,
+    path: String,
+    state: magpie_core::places::PlaceState,
+    /// files the index would take in, counted up to a cap
+    files: usize,
+    /// the count stopped early: there are at least this many
+    more: bool,
+}
+
+/// Where downloads, screenshots and chat apps' received files land on this
+/// computer, each with how it relates to the indexed folders and roughly how
+/// many files it holds, so the user can tell what ticking it means.
+#[tauri::command]
+async fn common_places(state: State<'_, AppState>) -> Result<Vec<CommonPlace>, String> {
+    let folders: Vec<String> = {
+        let conn = state.db.lock().await;
+        files::list_folders(&conn).map_err(err_str)?.into_iter().map(|f| f.path).collect()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        use magpie_core::places;
+        let found: Vec<(&'static str, String)> = places::detect(&places::Roots::from_os())
+            .into_iter()
+            .filter_map(|p| files::canonical_path(std::path::Path::new(&p.path)).map(|c| (p.kind, c)))
+            .collect();
+        // counted side by side: a big Downloads should not hold up the rest
+        std::thread::scope(|s| {
+            let handles: Vec<_> = found
+                .iter()
+                .map(|(kind, path)| {
+                    let folders = &folders;
+                    s.spawn(move || {
+                        let state = places::place_state(path, folders);
+                        let (files, more) = places::count_files(
+                            std::path::Path::new(path),
+                            50_000,
+                            std::time::Duration::from_millis(1500),
+                        );
+                        CommonPlace { kind, path: path.clone(), state, files, more }
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        })
+    })
+    .await
+    .map_err(err_str)
+}
+
+#[tauri::command]
+async fn remove_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder_id: i64,
+) -> Result<Vec<FolderInfo>, String> {
+    let out = {
+        let conn = state.db.lock().await;
+        files::remove_folder(&conn, folder_id).map_err(err_str)?;
+        files::list_folders(&conn).map_err(err_str)?
+    };
+    rewatch(&app);
+    Ok(out)
+}
+
+#[tauri::command]
+fn index_local(app: AppHandle) -> Result<(), String> {
+    spawn_local_index(app);
+    Ok(())
+}
+
+/// Wipe one folder's index (files, FTS, vectors, thumbnails) and re-scan it.
+#[tauri::command]
+async fn rebuild_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder_id: i64,
+) -> Result<(), String> {
+    if state.local_indexing.load(Ordering::SeqCst) {
+        return Err("indexing is running; try again when it finishes".into());
+    }
+    {
+        let conn = state.db.lock().await;
+        files::clear_folder_files(&conn, folder_id).map_err(err_str)?;
+    }
+    spawn_local_index(app);
+    Ok(())
+}
+
+// ---------- application launcher ----------
+
+// async: off the main thread. It runs on every keystroke, and on macOS the
+// main thread also carries window work and WKWebView's key events; queued
+// behind that, a search waited seconds in 0.3.0
+#[tauri::command(async)]
+fn search_apps(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<usize>,
+    pinyin: Option<bool>,
+) -> Result<Vec<magpie_core::apps::AppEntry>, String> {
+    let started = std::time::Instant::now();
+    // matched under the lock, which is released before the database is
+    // opened: an app rescan must not wait on it
+    let mut hits = {
+        let apps = state.apps.lock().unwrap();
+        // six: issue #4 had four apps starting with "mac" fill a cap of four
+        magpie_core::apps::match_apps(&apps, &query, limit.unwrap_or(6), pinyin.unwrap_or(true))
+    };
+    // frecency: the app you launch daily wins ties within its match tier
+    // (cap 0.08 < the 0.1 tier gaps, so exact matches stay on top)
+    if let Ok(conn) = db::open(&state.db_path) {
+        if let Ok(f) = magpie_core::frecency::factors(&conn, "app", unix_now()) {
+            magpie_core::frecency::boost(
+                &mut hits,
+                &f,
+                0.08,
+                |h| h.target.clone(),
+                |h| h.score,
+                |h, s| h.score = s,
+            );
+        }
+    }
+    let ms = started.elapsed().as_millis();
+    if ms > 50 {
+        log::info!("slow app search: {ms} ms");
+    }
+    Ok(hits)
+}
+
+/// Every app icon the backend holds (target → data URL, or null for an app
+/// known to have none). The palette takes them all at once, at start and
+/// after `app-icons-changed`, so an app row paints with its icon in its
+/// first frame; sending them with each search instead cost ~33 KB per
+/// keystroke against ~1 KB without.
+#[tauri::command]
+fn cached_app_icons(state: State<'_, AppState>) -> std::collections::HashMap<String, Option<String>> {
+    state.app_icons.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn launch_app(app: AppHandle, target: String) -> Result<(), String> {
+    // moved or uninstalled since the last scan (issue #4: an app moved into
+    // a folder still listed and would not open): rescan now and say so
+    if !magpie_core::apps::target_exists(&target) {
+        spawn_app_scan(app);
+        return Err("this app has moved or been removed; the app list is refreshed now".into());
+    }
+    start_app(&target, "an app result")?;
+    hide_palette(&app);
+    Ok(())
+}
+
+// ---------- system commands, processes, row actions ----------
+
+/// System commands matching the query (lock, sleep, restart, …).
+#[tauri::command(async)]
+fn search_commands(query: String) -> Vec<magpie_core::syscmd::CommandHit> {
+    magpie_core::syscmd::match_commands(&query)
+}
+
+/// Run a system command. A destructive one (restart, shut down, empty the
+/// trash) must come with `confirmed`, which the palette sets only after a
+/// second Enter; the check lives here too, so no caller can skip it.
+#[tauri::command(async)]
+fn run_system_command(app: AppHandle, id: String, confirmed: bool) -> Result<String, String> {
+    let destructive = magpie_core::syscmd::is_destructive(&id).ok_or_else(|| format!("unknown command {id:?}"))?;
+    if destructive && !confirmed {
+        return Err("confirm first".into());
+    }
+    // out of the way before the screen locks or the machine sleeps
+    hide_palette(&app);
+    log::info!("system command: {id}");
+    magpie_core::syscmd::run(&id).map_err(err_str)
+}
+
+/// Running processes whose name contains the query, for `kill <name>`.
+#[tauri::command]
+async fn list_processes(query: String) -> Result<Vec<magpie_core::procs::ProcHit>, String> {
+    tokio::task::spawn_blocking(move || magpie_core::procs::find(&query, 20))
+        .await
+        .map_err(err_str)
+}
+
+/// End a process the palette listed; refused if the PID now belongs to
+/// another program, or to magpie or the system.
+#[tauri::command]
+async fn end_process(pid: u32, name: String) -> Result<(), String> {
+    log::info!("ending process {pid} ({name})");
+    tokio::task::spawn_blocking(move || magpie_core::procs::end(pid, &name))
+        .await
+        .map_err(err_str)?
+        .map_err(err_str)
+}
+
+/// Extensions never opened from a row action: they would run a program
+/// rather than show a document.
+const RUNNABLE_EXTS: &[&str] = &[
+    "exe", "com", "bat", "cmd", "msi", "ps1", "vbs", "vbe", "js", "jse", "wsf", "scr", "lnk", "reg",
+    "app", "command", "sh", "run", "appimage", "desktop",
+];
+
+/// What the index knows about a web address, for the preview of a bookmark
+/// or history row (#13): read from the browsers' mirrored data, never from
+/// the web.
+#[tauri::command]
+async fn web_details(state: State<'_, AppState>, url: String) -> Result<magpie_core::webinfo::WebInfo, String> {
+    let conn = state.db.lock().await;
+    magpie_core::webinfo::of(&conn, &url).map_err(err_str)
+}
+
+/// Where a file was downloaded from, for the preview (see origin.rs). Only
+/// paths inside indexed folders or Downloads; the address is never logged.
+#[tauri::command]
+async fn file_origin(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Option<magpie_core::origin::Origin>, String> {
+    let allowed = {
+        let conn = state.db.lock().await;
+        files::path_is_allowed(&conn, &path).map_err(err_str)?
+    };
+    if !allowed {
+        return Err("path is outside indexed folders".into());
+    }
+    Ok(magpie_core::origin::of(std::path::Path::new(&path)))
+}
+
+/// Open an indexed file with its default app (the row's Enter reveals it in
+/// the folder instead). Only paths inside indexed folders, never programs.
+#[tauri::command]
+async fn open_path_default(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let allowed = {
+        let conn = state.db.lock().await;
+        files::path_is_allowed(&conn, &path).map_err(err_str)?
+    };
+    if !allowed {
+        return Err("path is outside indexed folders".into());
+    }
+    let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if RUNNABLE_EXTS.contains(&ext.as_str()) {
+        return Err("programs are not opened from here; use Enter to show it in its folder".into());
+    }
+    open_default(Path::new(&path), "a file result")
+}
+
+/// Convert an indexed PDF to Markdown (every page, in order). Scanned pages
+/// are read by the OCR engine when the user has it on; otherwise they are
+/// marked. Blocking work, off the main thread.
+async fn pdf_markdown_of(state: &AppState, path: &str) -> Result<String, String> {
+    let allowed = {
+        let conn = state.db.lock().await;
+        files::path_is_allowed(&conn, path).map_err(err_str)?
+    };
+    if !allowed {
+        return Err("path is outside indexed folders".into());
+    }
+    if !path.to_lowercase().ends_with(".pdf") {
+        return Err("not a PDF".into());
+    }
+    let ocr = state.ocr.clone();
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        files::pdf_to_markdown(Path::new(&path), &mut |img| {
+            ocr.lock().unwrap().as_mut().and_then(|e| e.extract_text(img).ok())
+        })
+    })
+    .await
+    .map_err(err_str)?
+    .map_err(err_str)
+}
+
+/// "Copy as Markdown" on a PDF row: the converted text.
+#[tauri::command]
+async fn pdf_markdown(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    pdf_markdown_of(&state, &path).await
+}
+
+/// "Save as Markdown…" on a PDF row: convert and write to `dest`, a path the
+/// user picked in the save dialog. Only `.md` files are written. Returns the
+/// number of characters written.
+#[tauri::command]
+async fn save_pdf_markdown(state: State<'_, AppState>, path: String, dest: String) -> Result<usize, String> {
+    let lower = dest.to_lowercase();
+    if !(lower.ends_with(".md") || lower.ends_with(".markdown")) {
+        return Err("save as a .md file".into());
+    }
+    let md = pdf_markdown_of(&state, &path).await?;
+    std::fs::write(&dest, &md).map_err(err_str)?;
+    Ok(md.chars().count())
+}
+
+/// Is `target` an app the scan found? Row actions on apps take only those.
+fn known_app(state: &AppState, target: &str) -> bool {
+    state.apps.lock().unwrap().iter().any(|a| a.target == target)
+}
+
+/// Show an app's bundle or shortcut in Finder / Explorer.
+#[tauri::command(async)]
+fn reveal_app(state: State<'_, AppState>, target: String) -> Result<(), String> {
+    if !known_app(&state, &target) {
+        return Err("not an installed app".into());
+    }
+    if magpie_core::apps::is_store_app(&target) {
+        return Err("a Store app has no folder to show".into());
+    }
+    tauri_plugin_opener::reveal_item_in_dir(&target).map_err(err_str)
+}
+
+/// Windows: start an app elevated (the UAC prompt appears). Elsewhere there
+/// is no such thing for a GUI app.
+#[tauri::command(async)]
+fn run_app_as_admin(app: AppHandle, state: State<'_, AppState>, target: String) -> Result<(), String> {
+    if !known_app(&state, &target) {
+        return Err("not an installed app".into());
+    }
+    if magpie_core::apps::is_store_app(&target) {
+        return Err("a Store app does not run as administrator".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // single quotes are doubled for PowerShell's literal string
+        let literal = target.replace('\'', "''");
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("Start-Process -Verb RunAs -FilePath '{literal}'")])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+            .map_err(err_str)?;
+        hide_palette(&app);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("running as administrator is a Windows feature".into())
+    }
+}
+
+/// Unix seconds of the last app scan, so a summon rescans at most once a
+/// minute.
+static LAST_APP_SCAN: AtomicU64 = AtomicU64::new(0);
+
+/// Rescan apps when the palette comes up, if the last scan is over a minute
+/// old: an app installed or moved a moment ago is then found on the next
+/// summon, not at the next half-hourly refresh. Costs nothing visible: the
+/// scan runs on its own thread and only changed icons are read.
+fn rescan_apps_if_stale(app: &AppHandle) {
+    let now = unix_now().max(0) as u64;
+    if now.saturating_sub(LAST_APP_SCAN.load(Ordering::SeqCst)) >= 60 {
+        spawn_app_scan(app.clone());
+    }
+}
+
+/// Re-enumerate installed apps (e.g. after installing something new).
+fn spawn_app_scan(app: AppHandle) {
+    LAST_APP_SCAN.store(unix_now().max(0) as u64, Ordering::SeqCst);
+    let state = app.state::<AppState>();
+    let apps = state.apps.clone();
+    let db_path = state.db_path.clone();
+    std::thread::spawn(move || {
+        let conn = db::open(&db_path).ok();
+        let extra = conn
+            .as_ref()
+            .and_then(|c| db::meta_get(c, "app_folders").ok().flatten())
+            .map(|t| magpie_core::apps::parse_app_folders(&t))
+            .unwrap_or_default();
+        let mut list = magpie_core::apps::list_apps_with(&extra);
+        // user alias rules ("proxy = clash") ride on top of the built-ins;
+        // applied before localizing, since rules name apps as installed
+        let mut ui_lang = String::from("en");
+        if let Some(conn) = conn {
+            if let Ok(Some(text)) = db::meta_get(&conn, "app_aliases") {
+                let rules = magpie_core::apps::parse_alias_rules(&text);
+                magpie_core::apps::apply_user_aliases(&mut list, &rules);
+            }
+            if let Ok(Some(lang)) = db::meta_get(&conn, "ui_lang") {
+                ui_lang = lang;
+            }
+        }
+        magpie_core::apps::localize(&mut list, &ui_lang);
+        *apps.lock().unwrap() = list;
+        tauri::async_runtime::spawn(prefetch_app_icons(app));
+    });
+}
+
+/// Add or remove a folder whose programs join the app list (issue #6: apps
+/// kept on an external drive). Returns the list as stored. A folder that is
+/// not there now (an unplugged drive) can still be removed.
+#[tauri::command(async)]
+fn set_app_folder(app: AppHandle, state: State<'_, AppState>, path: String, add: bool) -> Result<Vec<String>, String> {
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    let mut list: Vec<String> = db::meta_get(&conn, "app_folders")
+        .map_err(err_str)?
+        .map(|t| magpie_core::apps::parse_app_folders(&t))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let path = path.trim().to_string();
+    if add {
+        let p = std::path::Path::new(&path);
+        if !p.is_absolute() || !p.is_dir() {
+            return Err("pick a folder".into());
+        }
+        if !list.iter().any(|x| x == &path) {
+            list.push(path);
+        }
+    } else {
+        list.retain(|x| x != &path);
+    }
+    db::meta_set(&conn, "app_folders", &list.join("\n")).map_err(err_str)?;
+    drop(conn);
+    spawn_app_scan(app);
+    Ok(list)
+}
+
+/// Persist the "alias = app name" rule text and re-attach aliases in place.
+#[tauri::command]
+fn set_app_aliases(app: AppHandle, state: State<'_, AppState>, text: String) -> Result<(), String> {
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    db::meta_set(&conn, "app_aliases", &text).map_err(err_str)?;
+    drop(conn);
+    spawn_app_scan(app);
+    Ok(())
+}
+
+// ---------- video shot indexing ----------
+
+/// Background pass: shot-detect + embed every new/changed video in the
+/// indexed folders. Needs the image model; holds its lock per video (search
+/// degrades to "busy indexing" exactly like bulk image embedding does).
+fn spawn_video_index(app: AppHandle) {
+    let state = app.state::<AppState>();
+    // shots are found through the image model: without it, decoding (and
+    // fetching ffmpeg, ~80 MB) buys nothing. It runs again once the model
+    // is up (see spawn_siglip_init), so semantic search off or paused costs
+    // nothing here (#8)
+    if state.siglip.lock().unwrap().is_none() {
+        return;
+    }
+    if state.video_indexing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let db_path = state.db_path.clone();
+    let model_dir = state.model_dir.clone();
+    let siglip = state.siglip.clone();
+    let store = state.store.clone();
+    let running = state.video_indexing.clone();
+    let note = state.video_note.clone();
+    let ffmpeg_status = state.ffmpeg_status.clone();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<usize> {
+            let conn = db::open(&db_path)?;
+            let enabled = db::meta_get(&conn, "video_indexing")
+                .ok()
+                .flatten()
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if !enabled {
+                return Ok(0);
+            }
+            let pending = magpie_core::videos::pending_videos(&conn)?;
+            magpie_core::videos::prune_orphan_shots(&conn)?;
+            if pending.is_empty() {
+                return Ok(0);
+            }
+            // resolve ffmpeg once per pass (may download a static build);
+            // the settings row mirrors progress via ffmpeg_status
+            let fs2 = ffmpeg_status.clone();
+            let (_, label) = magpie_core::videos::ensure_ffmpeg_with(&model_dir, &mut move |m| {
+                *fs2.lock().unwrap() = m;
+            })?;
+            log::info!("ffmpeg resolved: {label}");
+            *ffmpeg_status.lock().unwrap() = label.to_string();
+            let total = pending.len();
+            let mut done = 0usize;
+            for (file_id, path, mtime) in pending {
+                let _ = app.emit(
+                    "local-progress",
+                    json!({ "stage": "videos", "done": done, "total": total }),
+                );
+                // hold the model only per video; skip (retry next pass) if a
+                // bulk image embed owns it right now
+                let opts = decode_opts_from_meta(&conn);
+                let indexed = match siglip.try_lock() {
+                    Ok(mut guard) => match guard.as_mut() {
+                        Some(s) => {
+                            magpie_core::videos::index_video(&conn, s, file_id, &path, mtime, opts)
+                        }
+                        None => return Ok(done), // model gone (reinit) — stop quietly
+                    },
+                    Err(_) => continue,
+                };
+                match indexed {
+                    Ok(_) => done += 1,
+                    Err(e) => {
+                        // a broken file must not wedge the queue: record the
+                        // attempt at this mtime and move on
+                        log::warn!("video index {path}: {e}");
+                        let _ = conn.execute(
+                            "INSERT INTO video_index (file_id, mtime, duration_ms, shot_count, indexed_at)
+                             VALUES (?1, ?2, 0, 0, strftime('%s','now'))
+                             ON CONFLICT(file_id) DO UPDATE SET mtime = excluded.mtime",
+                            magpie_core::rusqlite::params![file_id, mtime],
+                        );
+                    }
+                }
+            }
+            Ok(done)
+        })();
+        match result {
+            Ok(n) => {
+                *note.lock().unwrap() = String::new();
+                if n > 0 {
+                    reload_store(&db_path, &store);
+                    let _ = app.emit("local-done", json!({ "videos": n }));
+                    // fresh shots may need frame OCR (no-op when OCR is off)
+                    spawn_ocr_index(app.clone());
+                }
+            }
+            Err(e) => {
+                *note.lock().unwrap() = e.to_string();
+                log::warn!("video indexing failed: {e:#}");
+                let _ = app.emit("local-error", format!("video indexing: {e}"));
+            }
+        }
+        running.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Resolve ffmpeg early (system → magpie release asset → upstream) when the
+/// feature is on and the folders actually contain videos, so the binary is
+/// ready before the first index pass. Progress lands in ffmpeg_status.
+fn spawn_ffmpeg_check(app: AppHandle) {
+    let state = app.state::<AppState>();
+    // videos are only searchable with semantic search on (#8)
+    if !models_allowed(&state) {
+        return;
+    }
+    let db_path = state.db_path.clone();
+    let model_dir = state.model_dir.clone();
+    let status = state.ffmpeg_status.clone();
+    std::thread::spawn(move || {
+        let has_videos = (|| -> Result<bool> {
+            let conn = db::open(&db_path)?;
+            let enabled = db::meta_get(&conn, "video_indexing")?
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if !enabled {
+                return Ok(false);
+            }
+            let exts = magpie_core::videos::VIDEO_EXTS
+                .iter()
+                .map(|e| format!("'{e}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            Ok(conn.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM files WHERE lower(ext) IN ({exts}))"),
+                [],
+                |r| r.get(0),
+            )?)
+        })()
+        .unwrap_or(false);
+        if !has_videos {
+            return; // nothing to decode — never download 80 MB for nothing
+        }
+        let status2 = status.clone();
+        match magpie_core::videos::ensure_ffmpeg_with(&model_dir, &mut move |msg| {
+            *status2.lock().unwrap() = msg;
+        }) {
+            Ok((_, label)) => *status.lock().unwrap() = label.to_string(),
+            Err(e) => *status.lock().unwrap() = format!("missing: {e}"),
+        }
+    });
+}
+
+/// Decode limits from meta (threads default 2, hwaccel default off).
+fn decode_opts_from_meta(conn: &magpie_core::rusqlite::Connection) -> magpie_core::videos::DecodeOpts {
+    let threads = db::meta_get(conn, "video_decode_threads")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2);
+    let hwaccel = db::meta_get(conn, "video_hwaccel")
+        .ok()
+        .flatten()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    magpie_core::videos::DecodeOpts { threads, hwaccel }
+}
+
+/// Persist decode limits; they apply from the next decode onwards.
+#[tauri::command]
+fn set_video_decode(state: State<'_, AppState>, threads: u32, hwaccel: bool) -> Result<(), String> {
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    db::meta_set(&conn, "video_decode_threads", &threads.to_string()).map_err(err_str)?;
+    db::meta_set(&conn, "video_hwaccel", if hwaccel { "1" } else { "0" }).map_err(err_str)?;
+    Ok(())
+}
+
+/// Toggle video shot indexing; enabling kicks a pass immediately.
+#[tauri::command]
+fn set_video_indexing(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    db::meta_set(&conn, "video_indexing", if enabled { "1" } else { "0" }).map_err(err_str)?;
+    drop(conn);
+    if enabled {
+        spawn_ffmpeg_check(app.clone());
+        spawn_video_index(app);
+    }
+    Ok(())
+}
+
+/// Prune linked git worktrees whose main checkout is indexed (default on).
+/// Either way the next scan applies it: switching on drops the worktrees'
+/// rows as unseen files, switching off walks them again.
+#[tauri::command]
+fn set_skip_worktrees(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    db::meta_set(&conn, "skip_worktrees", if enabled { "1" } else { "0" }).map_err(err_str)?;
+    drop(conn);
+    spawn_local_index(app);
+    Ok(())
+}
+
+/// Allow background indexing while the screen is off, but ONLY on mains
+/// power. Disabled by default; changing it does not start/rebuild indexing.
+#[tauri::command]
+fn set_sleep_index(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    db::meta_set(&conn, "sleep_index_enabled", if enabled { "1" } else { "0" })
+        .map_err(err_str)
+}
+
+#[cfg(target_os = "macos")]
+fn on_ac_power() -> bool {
+    std::process::Command::new("/usr/bin/pmset")
+        .args(["-g", "batt"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.contains("AC Power"))
+        .unwrap_or(false) // on unknown power state: allow normal sleep
+}
+
+/// Own exactly one `caffeinate -i` process while real indexing work is live.
+/// -i inhibits idle SYSTEM sleep, not display sleep; `-w <our pid>` also
+/// exits if LocalSearch is killed. Manual Sleep and lid sleep still work.
+/// Never use -s/-d/-u and never change pmset defaults.
+#[cfg(target_os = "macos")]
+fn spawn_sleep_index_guard(app: AppHandle) {
+    std::thread::spawn(move || {
+        use std::process::{Child, Command, Stdio};
+        let mut guard: Option<Child> = None;
+        loop {
+            let state = app.state::<AppState>();
+            let enabled = db::open(&state.db_path)
+                .ok()
+                .and_then(|conn| db::meta_get(&conn, "sleep_index_enabled").ok().flatten())
+                .as_deref() == Some("1");
+            let working = state.local_indexing.load(Ordering::SeqCst)
+                || state.file_embedding_passes.load(Ordering::SeqCst) > 0
+                || state.video_indexing.load(Ordering::SeqCst)
+                || state.ocr_indexing.load(Ordering::SeqCst);
+            // pmset is called only when the user opted in AND indexing runs.
+            let required = enabled && working && on_ac_power();
+            if let Some(child) = guard.as_mut() {
+                match child.try_wait() {
+                    Ok(None) => {}
+                    Ok(Some(code)) => {
+                        log::warn!("index sleep inhibitor exited unexpectedly: {code}");
+                        guard = None;
+                        state.sleep_hold_active.store(false, Ordering::SeqCst);
+                    }
+                    Err(e) => log::warn!("checking caffeinate process: {e}"),
+                }
+            }
+            if required && guard.is_none() {
+                let pid = std::process::id().to_string();
+                match Command::new("/usr/bin/caffeinate")
+                    .args(["-i", "-w", &pid])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        guard = Some(child);
+                        state.sleep_hold_active.store(true, Ordering::SeqCst);
+                        log::info!("index sleep inhibitor started (AC + active indexing)");
+                    }
+                    Err(e) => log::warn!("cannot start caffeinate: {e}"),
+                }
+            } else if !required {
+                if let Some(mut child) = guard.take() {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap child (no zombies)
+                    log::info!("index sleep inhibitor released");
+                }
+                state.sleep_hold_active.store(false, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+}
+
+/// The thread cap the model sessions load with (see `magpie_core::threads`).
+/// A database that will not open falls back to the default cap rather than
+/// to every core: the polite choice is the safe one.
+fn index_threads(db_path: &std::path::Path) -> usize {
+    db::open(db_path)
+        .map(|c| magpie_core::threads::from_meta(&c))
+        .unwrap_or(magpie_core::threads::DEFAULT)
+}
+
+/// Re-create a loaded model so a load-time setting (the thread cap) applies
+/// now rather than after a restart. A load in flight gets one rerun queued
+/// through its reinit flag; a model that is off or failed is left alone and
+/// picks the setting up whenever it next loads.
+///
+/// `stop` runs first on both paths, before anything is spawned or queued,
+/// so that a load is always in flight once the passes have been told to
+/// stop: every load ends in a resume, and a stop can never be left behind
+/// with nobody to lift it. Returns whether a reload was started or queued.
+fn reload_loaded(
+    initing: &AtomicBool,
+    reinit: &AtomicBool,
+    status: &StdMutex<String>,
+    stop: impl FnOnce(),
+    spawn: impl FnOnce(),
+) -> bool {
+    if initing.load(Ordering::SeqCst) {
+        stop();
+        reinit.store(true, Ordering::SeqCst);
+        // the load may have ended between the check and the flag, in which
+        // case nobody is left to consume it: consume it here
+        if !initing.load(Ordering::SeqCst) && reinit.swap(false, Ordering::SeqCst) {
+            spawn();
+        }
+        return true;
+    }
+    if *status.lock().unwrap() == "ready" {
+        stop();
+        spawn();
+        return true;
+    }
+    false
+}
+
+/// Cap the CPU threads each model session (text, image, OCR) may use while
+/// indexing; 0 = every core. Persisted, then the loaded models are reloaded
+/// so the cap applies to the next embed pass, not to the next launch.
+#[tauri::command]
+async fn set_index_threads(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    threads: u32,
+) -> Result<(), String> {
+    {
+        let conn = state.db.lock().await;
+        db::meta_set(&conn, magpie_core::threads::META_KEY, &threads.to_string())
+            .map_err(err_str)?;
+    }
+    apply_index_threads(&app, state.inner());
+    Ok(())
+}
+
+/// Reload whichever models are loaded so the stored thread cap applies now.
+/// The text and image passes hold their model for a whole run, so a reload
+/// on its way also tells those passes to end at their next item: the new
+/// session swaps in within seconds instead of after the run, and the
+/// reload's catch-up pass carries on from where the run stopped. OCR takes
+/// its engine per item, so a swap there needs no such help.
+fn apply_index_threads(app: &AppHandle, state: &AppState) {
+    use magpie_core::threads::{self as th, Model};
+    reload_loaded(
+        &state.model_initing,
+        &state.model_reinit,
+        &state.model_status,
+        || th::stop(Model::Text),
+        || spawn_model_init(app.clone()),
+    );
+    reload_loaded(
+        &state.siglip_initing,
+        &state.siglip_reinit,
+        &state.siglip_status,
+        || th::stop(Model::Image),
+        || spawn_siglip_init(app.clone()),
+    );
+    reload_loaded(
+        &state.ocr_initing,
+        &state.ocr_reinit,
+        &state.ocr_status,
+        || {},
+        || spawn_ocr_init(app.clone()),
+    );
+}
+
+// ---------- MCP server for AI assistants ----------
+
+/// The MCP tools over the live app: a fresh read connection per call (WAL
+/// keeps it clear of the writer, and the palette's cancellable connection
+/// stays the palette's), the loaded models for query vectors, the resident
+/// vector store. The ranking is the palette's own, through the shared
+/// `rank_*` helpers, so an assistant sees the order the user sees.
+struct TauriBackend {
+    app: AppHandle,
+}
+
+fn tag_kind(mut v: serde_json::Value, kind: &str) -> serde_json::Value {
+    v["kind"] = serde_json::Value::from(kind);
+    v
+}
+
+/// A clip as the MCP server hands it out: passwords and keys never leave for
+/// another program in the clear, whatever the palette shows (issue #6).
+fn clip_for_mcp(mut c: clips::ClipHit) -> serde_json::Value {
+    if let Some(m) = c.masked.take() {
+        c.content = m;
+    }
+    tag_kind(serde_json::to_value(&c).unwrap_or_default(), "clip")
+}
+
+impl TauriBackend {
+    /// Query vectors the way the palette gets them: `try_lock`, so a bulk
+    /// embed pass owning a model degrades the call to keyword-only instead
+    /// of stalling it.
+    fn vectors(state: &AppState, words: &str, want_image: bool) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
+        if words.trim().is_empty() {
+            return (None, None);
+        }
+        let text = state
+            .embedder
+            .try_lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|e| e.embed_query(words).ok()));
+        let image = if want_image {
+            state
+                .siglip
+                .try_lock()
+                .ok()
+                .and_then(|mut g| g.as_mut().and_then(|s| s.embed_query(words).ok()))
+        } else {
+            None
+        };
+        (text, image)
+    }
+}
+
+impl mcp::Backend for TauriBackend {
+    fn search(&self, source: mcp::Source, query: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
+        use mcp::Source::{Bookmarks, Clips, History, Local, Stars};
+        let trace_start = std::time::Instant::now();
+        let state = self.app.state::<AppState>();
+        let conn = db::open(&state.db_path)?;
+        let db_open_ms = trace_start.elapsed().as_millis();
+        // local queries carry filter tokens: embed the words only, as the palette does
+        let words = match source {
+            Local => magpie_core::filters::parse(query).1,
+            _ => query.to_string(),
+        };
+        let (qvec, image_qvec) = Self::vectors(&state, &words, matches!(source, Local | Clips));
+        let vectors_ms = trace_start.elapsed().as_millis().saturating_sub(db_open_ms);
+        let lock_start = std::time::Instant::now();
+        let store = state.store.lock().unwrap();
+        let store_wait_ms = lock_start.elapsed().as_millis();
+        let rank_start = std::time::Instant::now();
+        let result = match source {
+            Local => rank_local(
+                &conn,
+                &store,
+                query,
+                qvec.as_deref(),
+                image_qvec.as_deref(),
+                search::LocalScope::All,
+                limit,
+            )?,
+            Stars => rank_stars(&conn, &store, query, qvec.as_deref(), search::RepoSort::Relevance, limit)?
+                .into_iter()
+                .map(|h| tag_kind(serde_json::to_value(&h).unwrap_or_default(), "repo"))
+                .collect(),
+            Bookmarks => rank_web(&conn, &store, query, qvec.as_deref(), "bookmarks", limit)?,
+            History => rank_web(&conn, &store, query, qvec.as_deref(), "history", limit)?,
+            Clips => {
+                search::search_clips(&conn, &store, query, qvec.as_deref(), image_qvec.as_deref(), limit)?
+                    .into_iter()
+                    .map(clip_for_mcp)
+                    .collect()
+            }
+        };
+        if matches!(source, Local) && trace_start.elapsed().as_millis() >= 150 {
+            // No query string, source document text, names, or paths in logs.
+            log::info!(
+                "mcp_local_phases: total={}ms db={}ms vector_query={}ms store_wait={}ms ranking={}ms text_vector={} image_vector={}",
+                trace_start.elapsed().as_millis(), db_open_ms, vectors_ms, store_wait_ms,
+                rank_start.elapsed().as_millis(), qvec.is_some(), image_qvec.is_some()
+            );
+        }
+        Ok(result)
+    }
+
+    fn read_file(&self, path: &str, max_chars: usize) -> Result<mcp::ReadOutcome> {
+        let state = self.app.state::<AppState>();
+        let conn = db::open(&state.db_path)?;
+        // the same fence open_file uses: only what the user chose to index
+        if !files::path_is_allowed(&conn, path)? {
+            return Ok(mcp::ReadOutcome::Outside);
+        }
+        let Some(hit) = files::file_by_path(&conn, path)? else {
+            return Ok(mcp::ReadOutcome::NotIndexed);
+        };
+        // the indexed text, not the bytes on disk: PDF, Office and OCR text
+        // come out as text, and the size cap the user set already applied
+        let content: Option<String> =
+            conn.query_row("SELECT content FROM files WHERE id = ?1", [hit.id], |r| r.get(0))?;
+        let full = content.unwrap_or_default();
+        let total = full.chars().count();
+        let text: String = full.chars().take(max_chars).collect();
+        Ok(mcp::ReadOutcome::Text(json!({
+            "path": hit.path,
+            "name": hit.name,
+            "ext": hit.ext,
+            "size": hit.size,
+            "mtime": hit.mtime,
+            "chars": total,
+            "clipped": total > max_chars,
+            "note": if total == 0 { "no indexed text: an image without OCR, a video, or a binary" } else { "" },
+            "text": text,
+        })))
+    }
+
+    fn recent(&self, source: mcp::Source, limit: usize) -> Result<Vec<serde_json::Value>> {
+        use mcp::Source::{Bookmarks, Clips, History, Local, Stars};
+        let kinds: &[&str] = match source {
+            Local => &["file", "video"],
+            Stars => &["repo"],
+            Bookmarks => &["bookmark"],
+            History => &["history"],
+            Clips => return Ok(Vec::new()),
+        };
+        let state = self.app.state::<AppState>();
+        let conn = db::open(&state.db_path)?;
+        recent_rows(&conn, &[], kinds, limit)
+    }
+}
+
+/// Start the MCP server from the stored settings: the remembered port (or
+/// any free one, then remembered so client configs stay valid) and the
+/// stored token (minted on first use). Reports through `mcp_status`.
+fn start_mcp(app: AppHandle) {
+    let state = app.state::<AppState>();
+    let db_path = state.db_path.clone();
+    let slot = state.mcp.clone();
+    let status = state.mcp_status.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = async {
+            let (port, token) = {
+                let conn = db::open(&db_path)?;
+                let port = db::meta_get(&conn, "mcp_port")?
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(0);
+                let token = match db::meta_get(&conn, "mcp_token")? {
+                    Some(t) if t.len() >= 32 => t,
+                    _ => {
+                        let t = mcp::new_token()?;
+                        db::meta_set(&conn, "mcp_token", &t)?;
+                        t
+                    }
+                };
+                (port, token)
+            };
+            let backend: Arc<dyn mcp::Backend> = Arc::new(TauriBackend { app: app.clone() });
+            let server = mcp::serve(backend, token, port).await?;
+            if server.port != port {
+                let conn = db::open(&db_path)?;
+                db::meta_set(&conn, "mcp_port", &server.port.to_string())?;
+            }
+            anyhow::Ok(server)
+        }
+        .await;
+        match outcome {
+            Ok(server) => {
+                log::info!("mcp server listening on 127.0.0.1:{}", server.port);
+                *status.lock().unwrap() = "listening".into();
+                *slot.lock().unwrap() = Some(server);
+            }
+            Err(e) => {
+                log::warn!("mcp server failed to start: {e:#}");
+                *status.lock().unwrap() = format!("failed: {e}");
+            }
+        }
+    });
+}
+
+fn stop_mcp(state: &AppState) {
+    if let Some(server) = state.mcp.lock().unwrap().take() {
+        server.stop();
+        log::info!("mcp server stopped");
+    }
+    *state.mcp_status.lock().unwrap() = String::new();
+}
+
+/// Switch the MCP server on or off. Persisted, applied now.
+#[tauri::command]
+async fn set_mcp(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    {
+        let conn = state.db.lock().await;
+        db::meta_set(&conn, "mcp_enabled", if enabled { "1" } else { "0" }).map_err(err_str)?;
+    }
+    if enabled {
+        // one start at a time: a second one while the first still binds
+        // would lose the race for the remembered port and move it for nothing
+        let running = state.mcp.lock().unwrap().is_some();
+        let starting = *state.mcp_status.lock().unwrap() == "starting";
+        if !running && !starting {
+            *state.mcp_status.lock().unwrap() = "starting".into();
+            start_mcp(app);
+        }
+    } else {
+        stop_mcp(&state);
+    }
+    Ok(())
+}
+
+/// Mint a new bearer token. A running server restarts with it on the same
+/// port, so every client has to be re-added with the new command.
+#[tauri::command]
+async fn rotate_mcp_token(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // a start in flight has already read the token it will serve with; a
+    // new one written now would not match it
+    if *state.mcp_status.lock().unwrap() == "starting" {
+        return Err("the server is still starting; try again in a moment".into());
+    }
+    let token = mcp::new_token().map_err(err_str)?;
+    {
+        let conn = state.db.lock().await;
+        db::meta_set(&conn, "mcp_token", &token).map_err(err_str)?;
+    }
+    if state.mcp.lock().unwrap().is_some() {
+        stop_mcp(&state);
+        *state.mcp_status.lock().unwrap() = "starting".into();
+        start_mcp(app);
+    }
+    Ok(())
+}
+
+// ---------- file watcher ----------
+
+/// Minutes between full reconciliation walks when nothing is stored.
+const DEFAULT_RESCAN_MINUTES: u64 = 1440;
+
+/// How often the full walk runs, in minutes; 0 means never.
+fn rescan_minutes(app: &AppHandle) -> u64 {
+    let state = app.state::<AppState>();
+    db::open(&state.db_path)
+        .ok()
+        .and_then(|c| db::meta_get(&c, "rescan_minutes").ok().flatten())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RESCAN_MINUTES)
+}
+
+/// Watch every registered folder. Events land in `pending`; the ticker
+/// turns them into scoped re-indexes. Called at startup and whenever the
+/// folder list or the switch changes: a fresh watcher replaces the old one
+/// each time, and switching off simply drops it.
+fn rewatch(app: &AppHandle) {
+    use notify::Watcher;
+    let state = app.state::<AppState>();
+    let conn = db::open(&state.db_path).ok();
+    let enabled = conn
+        .as_ref()
+        .and_then(|c| db::meta_get(c, "watch_enabled").ok().flatten())
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if !enabled {
+        *state.watcher.lock().unwrap() = None;
+        *state.watch_status.lock().unwrap() = String::new();
+        state.watched_folders.store(0, Ordering::SeqCst);
+        return;
+    }
+    let folders = conn.as_ref().and_then(|c| files::list_folders(c).ok()).unwrap_or_default();
+    let roots: Vec<PathBuf> = folders.iter().map(|f| PathBuf::from(&f.path)).collect();
+    let pending = state.pending.clone();
+    let built = notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+        Ok(ev) => {
+            let now = std::time::Instant::now();
+            let mut p = pending.lock().unwrap();
+            if ev.need_rescan() {
+                // the OS dropped events: only a full walk knows what changed
+                p.rescan_all(now);
+            } else if !matches!(ev.kind, notify::EventKind::Access(_)) {
+                // dotfile churn (.git above all) never reaches the index;
+                // keep it out of the queue so it cannot force a full walk
+                for path in ev.paths.into_iter().filter(|path| !watch::is_noise(path, &roots)) {
+                    p.push(path, now);
+                }
+            }
+        }
+        Err(e) => log::warn!("file watcher: {e}"),
+    });
+    let mut watcher = match built {
+        Ok(w) => w,
+        Err(e) => {
+            log::warn!("file watcher unavailable: {e}");
+            *state.watcher.lock().unwrap() = None;
+            *state.watch_status.lock().unwrap() = format!("failed: {e}");
+            state.watched_folders.store(0, Ordering::SeqCst);
+            return;
+        }
+    };
+    let mut watched = 0usize;
+    for f in &folders {
+        match watcher.watch(Path::new(&f.path), notify::RecursiveMode::Recursive) {
+            Ok(()) => watched += 1,
+            Err(e) => log::warn!("file watcher: cannot watch {}: {e}", f.path),
+        }
+    }
+    log::info!("file watcher on {watched} of {} folders", folders.len());
+    state.watched_folders.store(watched, Ordering::SeqCst);
+    *state.watch_status.lock().unwrap() = "watching".into();
+    // the old watcher (if any) drops here and stops reporting
+    *state.watcher.lock().unwrap() = Some(watcher);
+}
+
+/// Once a second: when the disk has been quiet, hand the pending changes
+/// to a scoped re-index. A pass already running (a full walk, say) keeps
+/// them queued for the next tick.
+fn spawn_watch_ticker(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let now = std::time::Instant::now();
+            let batch = app.state::<AppState>().pending.lock().unwrap().take_if_quiet(now);
+            let Some(batch) = batch else { continue };
+            let started = match &batch {
+                watch::Batch::All => start_local_index(app.clone(), Scope::All),
+                watch::Batch::Paths(paths) => {
+                    log::info!("file watcher: re-indexing {} changed path(s)", paths.len());
+                    start_local_index(app.clone(), Scope::Paths(paths.clone()))
+                }
+            };
+            if !started {
+                app.state::<AppState>().pending.lock().unwrap().put_back(batch, now);
+            }
+        }
+    });
+}
+
+/// Switch the file watcher on or off (default on). Persisted, applied now;
+/// switching on also runs a full walk, since what changed meanwhile is
+/// unknown.
+#[tauri::command]
+async fn set_watch(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    {
+        let conn = state.db.lock().await;
+        db::meta_set(&conn, "watch_enabled", if enabled { "1" } else { "0" }).map_err(err_str)?;
+    }
+    rewatch(&app);
+    if enabled {
+        spawn_local_index(app);
+    }
+    Ok(())
+}
+
+/// Minutes between full reconciliation walks (0 = never). Read by the
+/// periodic loop once a minute, so it applies without a restart.
+#[tauri::command]
+async fn set_rescan_minutes(state: State<'_, AppState>, minutes: u32) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    db::meta_set(&conn, "rescan_minutes", &minutes.to_string()).map_err(err_str)?;
+    Ok(())
+}
+
+// ---------- launch at login ----------
+
+/// Whether magpie starts at login. Read from the OS registration itself (a
+/// LaunchAgent, the Run key, an XDG autostart file), never from a stored
+/// flag, so removing it in the OS's own settings shows up here too.
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(err_str)
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, on: bool) -> Result<(), String> {
+    if option_env!("LOCALSEARCH_PARALLEL_TEST").is_some() && on {
+        return Err("Автозапуск отключён в тестовой версии".into());
+    }
+    use tauri_plugin_autostart::ManagerExt;
+    let al = app.autolaunch();
+    if on {
+        al.enable().map_err(err_str)
+    } else {
+        al.disable().map_err(err_str)
+    }
+}
+
+// ---------- app icons ----------
+
+/// How often the installed-app list and its icons are refreshed while the
+/// app runs (it is always refreshed at launch).
+const APP_RESCAN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// [`APP_RESCAN`], or `MAGPIE_APP_RESCAN_SECS` when set: a test hook, so a
+/// check of the refresh does not have to wait half an hour.
+fn app_rescan_every() -> std::time::Duration {
+    std::env::var("MAGPIE_APP_RESCAN_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&s: &u64| s > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(APP_RESCAN)
+}
+
+/// Rendered edge of an app icon. The row shows it at 26 CSS px; 64 keeps it
+/// sharp on a 2x display.
+const APP_ICON_PX: u32 = 64;
+
+/// The icon for an app from the installed-app list, as a data URL, or None.
+/// Only targets the app scan found are served, so the webview cannot use
+/// this to probe arbitrary paths. Cached per target for the session.
+#[tauri::command]
+async fn app_icon(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    target: String,
+) -> Result<Option<String>, String> {
+    if let Some(hit) = state.app_icons.lock().unwrap().get(&target) {
+        return Ok(hit.clone());
+    }
+    let known = state.apps.lock().unwrap().iter().any(|a| a.target == target);
+    if !known {
+        return Ok(None);
+    }
+    let (url, _) = read_and_remember_icon(&app, target.clone()).await;
+    state.app_icons.lock().unwrap().insert(target, url.clone());
+    Ok(url)
+}
+
+/// The icon of an installed browser, by the name web hits carry ("chrome",
+/// "librewolf"): that browser's app icon, from the same cache as app rows.
+/// None when no installed app matches the name.
+#[tauri::command]
+async fn browser_icon(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    browser: String,
+) -> Result<Option<String>, String> {
+    let target = {
+        let apps = state.apps.lock().unwrap();
+        magpie_core::apps::app_named(&apps, &browser).map(|a| a.target.clone())
+    };
+    match target {
+        Some(target) => app_icon(app, state, target).await,
+        None => Ok(None),
+    }
+}
+
+/// After a search shows apps: re-read the icons of those that changed since
+/// their icon was cached (an update installed a new one), in the
+/// background. Returns at once; a stat per app when nothing changed. The
+/// palette hears `app-icons-changed` if any icon was replaced.
+#[tauri::command]
+fn refresh_app_icons(app: AppHandle, targets: Vec<String>) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let mut replaced = 0usize;
+        for target in targets.into_iter().take(12) {
+            if !known_app(&state, &target) {
+                continue;
+            }
+            let t = target.clone();
+            let stamp = tokio::task::spawn_blocking(move || magpie_core::apps::icon_stamp(&t))
+                .await
+                .unwrap_or(0);
+            {
+                // unknown (never read yet: the row asks for it itself) or
+                // unchanged. A change is claimed here, under the lock, so the
+                // next keystroke's refresh does not read the same icon again.
+                let mut stamps = state.icon_stamps.lock().unwrap();
+                match stamps.get(&target) {
+                    Some(&cached) if cached != stamp && stamp != 0 => {
+                        stamps.insert(target.clone(), stamp);
+                    }
+                    _ => continue,
+                }
+            }
+            let (url, _) = read_and_remember_icon(&app, target.clone()).await;
+            state.app_icons.lock().unwrap().insert(target, url);
+            replaced += 1;
+        }
+        if replaced > 0 {
+            log::info!("app icons: {replaced} refreshed after a search");
+            let _ = app.emit("app-icons-changed", ());
+        }
+    });
+}
+
+/// Read one icon from the OS and keep it in the database with the app's
+/// stamp, so the next launch finds it there. Returns the data URL and
+/// whether the OS had an icon.
+async fn read_and_remember_icon(app: &AppHandle, target: String) -> (Option<String>, bool) {
+    let stamp = magpie_core::apps::icon_stamp(&target);
+    let icon = read_app_icon(target.clone()).await;
+    let url = icon.as_ref().map(|i| icon_data_url(i.clone()));
+    let found = icon.is_some();
+    app.state::<AppState>().icon_stamps.lock().unwrap().insert(target.clone(), stamp);
+    let db_path = app.state::<AppState>().db_path.clone();
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = db::open(&db_path)?;
+        magpie_core::apps::store_icon(&conn, &target, stamp, icon.as_ref())
+    })
+    .await;
+    (url, found)
+}
+
+fn icon_data_url(i: magpie_core::apps::Icon) -> String {
+    use base64::Engine;
+    format!("data:{};base64,{}", i.mime, base64::engine::general_purpose::STANDARD.encode(i.bytes))
+}
+
+/// Fill the icon cache right after the app scan. Icons remembered in the
+/// database from an earlier launch are used as long as the app's stamp has
+/// not moved, so after the first launch this reads only new or updated
+/// apps. Reading is what costs: 10 to 60 ms an icon on Windows, 50 ms to a
+/// second on macOS (measured on a CI Mac), which on the first launch of
+/// 0.3.0 kept a Mac busy for a minute or more. Icons of apps that are gone
+/// are forgotten. The short pause between reads keeps this in the
+/// background.
+async fn prefetch_app_icons(app: AppHandle) {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return; // an alias change rescanned apps while a prefetch still runs
+    }
+    let state = app.state::<AppState>();
+    let targets: Vec<String> = state.apps.lock().unwrap().iter().map(|a| a.target.clone()).collect();
+    let started = std::time::Instant::now();
+    let db_path = state.db_path.clone();
+    let listed = targets.clone();
+    // stamps and remembered icons in one blocking pass: a stat per app
+    let remembered = tokio::task::spawn_blocking(move || -> Result<(Vec<i64>, _, usize)> {
+        let conn = db::open(&db_path)?;
+        let stamps = listed.iter().map(|t| magpie_core::apps::icon_stamp(t)).collect();
+        let cached = magpie_core::apps::cached_icons(&conn)?;
+        let installed = listed.iter().cloned().collect();
+        let pruned = magpie_core::apps::prune_icons(&conn, &installed)?;
+        Ok((stamps, cached, pruned))
+    })
+    .await;
+    let (stamps, mut cached, pruned) = match remembered {
+        Ok(Ok(v)) => v,
+        _ => (vec![0; targets.len()], Default::default(), 0),
+    };
+    let mut from_cache = 0usize;
+    let mut stale = Vec::new();
+    {
+        let mut mem = state.app_icons.lock().unwrap();
+        let mut known_stamps = state.icon_stamps.lock().unwrap();
+        for (target, stamp) in targets.into_iter().zip(stamps) {
+            match cached.remove(&target) {
+                Some((s, icon)) if s == stamp && stamp != 0 => {
+                    known_stamps.insert(target.clone(), stamp);
+                    mem.insert(target, icon.map(icon_data_url));
+                    from_cache += 1;
+                }
+                _ => stale.push(target),
+            }
+        }
+    }
+    let mut read = 0usize;
+    for target in stale {
+        if state.app_icons.lock().unwrap().contains_key(&target) {
+            continue; // fetched on demand meanwhile
+        }
+        let (url, _) = read_and_remember_icon(&app, target.clone()).await;
+        state.app_icons.lock().unwrap().insert(target, url);
+        read += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    // the launch pass and any pass that changed something are worth a line;
+    // a quiet half-hourly refresh is not
+    static LOGGED_ONCE: AtomicBool = AtomicBool::new(false);
+    let changed = read > 0 || pruned > 0;
+    // swap before the test, never inside it: short-circuited behind
+    // `changed`, the flag stayed unset and the first quiet pass logged
+    let first = !LOGGED_ONCE.swap(true, Ordering::SeqCst);
+    let level = if changed || first {
+        log::Level::Info
+    } else {
+        log::Level::Debug
+    };
+    log::log!(
+        level,
+        "app icons: {from_cache} remembered, {read} read, {pruned} forgotten, in {} ms",
+        started.elapsed().as_millis()
+    );
+    if changed {
+        // the palette keeps its own copy of each icon; drop it
+        let _ = app.emit("app-icons-changed", ());
+    }
+    RUNNING.store(false, Ordering::SeqCst);
+}
+
+/// Read one icon on the blocking pool, on every platform. 0.3.0 read macOS
+/// icons on the main thread to be safe with AppKit; that thread also runs
+/// window work and WKWebView's key events, and a Mac's first launch spent a
+/// minute or more there reading icons while searches waited seconds. The
+/// reads are safe off it: CI runs them on background threads under Apple's
+/// Main Thread Checker with crash-on-report, clean, while a control call
+/// (an NSView made off the main thread) is caught.
+async fn read_app_icon(target: String) -> Option<magpie_core::apps::Icon> {
+    tokio::task::spawn_blocking(move || magpie_core::apps::icon(&target, APP_ICON_PX))
+        .await
+        .ok()
+        .flatten()
+}
+
+// ---------- clipboard history ----------
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[tauri::command]
+async fn search_clips(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<ClipHit>, String> {
+    let limit = limit.unwrap_or(50);
+    let qvec = if query.trim().is_empty() {
+        None
+    } else {
+        match state.embedder.try_lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(e) => e.embed_query(&query).ok(),
+                None => None,
+            },
+            Err(_) => None, // bulk embed in progress; keyword-only is fine
+        }
+    };
+    // image clips answer to descriptions via SigLIP's text encoder
+    let image_qvec = if query.trim().is_empty() {
+        None
+    } else {
+        match state.siglip.try_lock() {
+            Ok(mut guard) => guard.as_mut().and_then(|s| s.embed_query(&query).ok()),
+            Err(_) => None,
+        }
+    };
+    let Some(conn) = take_state_search_conn(&state).await else {
+        return Ok(Vec::new()); // superseded; the frontend drops stale answers
+    };
+    let store = state.store.lock().unwrap();
+    search::search_clips(&conn, &store, &query, qvec.as_deref(), image_qvec.as_deref(), limit)
+        .map_err(err_str)
+}
+
+/// Copy an image clip back to the clipboard.
+#[tauri::command]
+async fn copy_image_clip(state: State<'_, AppState>, clip_id: i64) -> Result<(), String> {
+    let jpeg = {
+        let conn = state.db.lock().await;
+        clips::image_clip_jpeg(&conn, clip_id)
+            .map_err(err_str)?
+            .ok_or("image clip not found")?
+    };
+    tokio::task::spawn_blocking(move || clips::set_clipboard_image(&jpeg))
+        .await
+        .map_err(err_str)?
+        .map_err(err_str)
+}
+
+#[tauri::command]
+async fn set_clipboard_enabled(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    {
+        let conn = state.db.lock().await;
+        db::meta_set(&conn, "clipboard_enabled", if enabled { "1" } else { "0" })
+            .map_err(err_str)?;
+    }
+    state.clip_watch.store(enabled, Ordering::SeqCst);
+    if enabled {
+        spawn_clip_watcher(app);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_clip_retention(state: State<'_, AppState>, days: u32) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    db::meta_set(&conn, "clip_retention_days", &days.to_string()).map_err(err_str)?;
+    let now = unix_now();
+    clips::prune_clips(&conn, days, now).map_err(err_str)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_clip_max_entries(state: State<'_, AppState>, entries: u32) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    db::meta_set(&conn, "clip_max_entries", &entries.to_string()).map_err(err_str)?;
+    clips::prune_clips_to_count(&conn, entries).map_err(err_str)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_clip(state: State<'_, AppState>, clip_id: i64) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    clips::delete_clip(&conn, clip_id).map_err(err_str)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn clear_clips_now(state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    clips::clear_clips(&conn).map_err(err_str)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn copy_clip(text: String) -> Result<(), String> {
+    clips::set_clipboard_text(&text).map_err(err_str)
+}
+
+/// Copy a clip AND paste it into the app the user came from: hide the
+/// palette, wait for focus to return to the previous window, then synthesize
+/// the platform paste chord.
+#[tauri::command]
+async fn paste_clip(app: AppHandle, text: String) -> Result<(), String> {
+    clips::set_clipboard_text(&text).map_err(err_str)?;
+    // the paste goes to the app that had the focus: hand it back
+    dismiss_palette(&app);
+    tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+    send_mod_chord(&app, 'v').await.map_err(err_str)
+}
+
+/// Synthesize the platform copy/paste chord (Cmd on macOS, Ctrl elsewhere)
+/// plus `letter`, on the main thread. macOS requires that: enigo turns a
+/// letter into a key code through the Text Input Sources API, which asserts
+/// it runs on the main queue, and since macOS 14 a call from any other
+/// thread kills the process outright. That was issue #4, where the
+/// selection chord made magpie vanish. The main thread is free to take this:
+/// the three key events are a few milliseconds of work.
+async fn send_mod_chord(app: &AppHandle, letter: char) -> Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        let _ = tx.send(mod_chord_now(letter));
+    })
+    .map_err(|e| anyhow::anyhow!("main thread: {e}"))?;
+    rx.await.map_err(|_| anyhow::anyhow!("the main thread dropped the key chord"))?
+}
+
+fn mod_chord_now(letter: char) -> Result<()> {
+    use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+    let mut e = Enigo::new(&Settings::default()).map_err(|e| anyhow::anyhow!("input: {e}"))?;
+    #[cfg(target_os = "macos")]
+    let modifier = Key::Meta;
+    #[cfg(not(target_os = "macos"))]
+    let modifier = Key::Control;
+    e.key(modifier, Direction::Press).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let clicked = e.key(Key::Unicode(letter), Direction::Click);
+    // release the modifier even when the letter failed, or it stays held
+    e.key(modifier, Direction::Release).map_err(|e| anyhow::anyhow!("{e}"))?;
+    clicked.map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Seek arguments for known players, by executable stem. Pure — unit tested.
+/// macOS opens videos with the default app and never seeks, so there it is
+/// only exercised by the tests.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn player_seek_args(exe_stem: &str, path: &str, ts_ms: i64) -> Option<Vec<String>> {
+    let secs = ts_ms as f64 / 1000.0;
+    let (h, rem) = (ts_ms / 3_600_000, ts_ms % 3_600_000);
+    let (m, s) = (rem / 60_000, (rem % 60_000) / 1000);
+    match exe_stem.to_lowercase().as_str() {
+        "vlc" => Some(vec![format!("--start-time={secs:.1}"), path.into()]),
+        "mpv" | "iina" => Some(vec![format!("--start={secs:.1}"), path.into()]),
+        st if st.starts_with("potplayer") => {
+            Some(vec![path.into(), format!("/seek={h}:{m:02}:{s:02}")])
+        }
+        st if st.starts_with("mpc-hc") || st.starts_with("mpc-be") => {
+            Some(vec![path.into(), "/start".into(), ts_ms.to_string()])
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{player_seek_args, text_window};
+
+    #[test]
+    fn a_text_preview_window() {
+        // short text, no query: all of it
+        assert_eq!(text_window("hello\nworld", None, false), ("hello\nworld", false, false));
+        assert_eq!(text_window("hello\nworld", Some("  "), true), ("hello\nworld", false, false));
+        assert_eq!(text_window("", Some("x"), true), ("", false, false));
+        assert_eq!(text_window("", None, false), ("", false, false));
+        // a query that is not there: from the top
+        assert_eq!(text_window("a\nb", Some("zzz"), true), ("a\nb", false, false));
+        // long text: 400 bytes above the match, 2400 bytes in all
+        let text = format!("{}needle{}", "a".repeat(1000), "b".repeat(5000));
+        let (w, head, tail) = text_window(&text, Some("NEEDLE"), false);
+        assert_eq!((w.len(), head, tail), (2400, true, true));
+        assert!(w.starts_with(&"a".repeat(400)) && w[400..].starts_with("needle"), "{}", &w[..410]);
+        // a match near the top keeps the start
+        let (w, head, _) = text_window(&text, Some("aaa"), false);
+        assert_eq!((w.len(), head), (2400, false));
+        // multi-byte text never splits a char
+        let cjk = "汉".repeat(2000);
+        let (w, _, tail) = text_window(&cjk, None, false);
+        assert!(tail && w.len() <= 2402 && w.chars().all(|c| c == '汉'));
+    }
+
+    #[test]
+    fn a_list_window_shows_whole_lines() {
+        let names: Vec<String> = (0..300).map(|i| format!("folder/file-{i:03}.txt")).collect();
+        let list = names.join("\n");
+        let (w, head, tail) = text_window(&list, Some("file-150"), true);
+        assert!(head && tail);
+        let shown: Vec<&str> = w.lines().collect();
+        assert!(shown.iter().all(|l| names.iter().any(|n| n == l)), "only whole names: {w}");
+        assert!(shown.contains(&"folder/file-150.txt"));
+        assert_eq!(&list[list.find(w).unwrap()..][..w.len()], w);
+        // no query: from the first name
+        let (w, head, tail) = text_window(&list, None, true);
+        assert!(!head && tail && w.starts_with("folder/file-000.txt\n") && !w.ends_with('\n'));
+        // a matched name longer than the window stays whole
+        let long = format!("{}\nx{}needle{}\nlast", "a\n".repeat(300), "y".repeat(500), "z".repeat(3000));
+        let (w, _, tail) = text_window(&long, Some("needle"), true);
+        assert!(w.ends_with('z') && tail, "{}", &w[w.len() - 5..]);
+        // lowercasing that changes byte lengths does not split a char
+        let odd = format!("{}\n{}needle\nrest", "İ".repeat(700), "İ".repeat(700));
+        let _ = text_window(&odd, Some("needle"), true);
+        let _ = text_window(&odd, Some("needle"), false);
+    }
+
+    #[test]
+    fn seek_args_per_player() {
+        let p = "C:\\v\\a.mp4";
+        assert_eq!(
+            player_seek_args("vlc", p, 204_500).unwrap(),
+            vec!["--start-time=204.5".to_string(), p.to_string()]
+        );
+        assert_eq!(
+            player_seek_args("mpv", p, 5_000).unwrap()[0],
+            "--start=5.0"
+        );
+        assert_eq!(
+            player_seek_args("PotPlayerMini64", p, 3_725_000).unwrap()[1],
+            "/seek=1:02:05"
+        );
+        assert_eq!(
+            player_seek_args("mpc-hc64", p, 1500).unwrap()[2],
+            "1500"
+        );
+        assert!(player_seek_args("wmplayer", p, 0).is_none(), "no seek interface");
+    }
+}
+
+/// Play a video at a timestamp with the SYSTEM DEFAULT player when it has a
+/// seek interface (VLC / mpv / PotPlayer / MPC — resolved from the user's own
+/// file association, never overriding their choice); otherwise a plain open.
+#[tauri::command]
+fn play_video(path: String, ts_ms: i64) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let assoc = (|| -> Option<(String, Vec<String>)> {
+            use winreg::enums::{HKEY_CLASSES_ROOT, HKEY_CURRENT_USER};
+            use winreg::RegKey;
+            let ext = std::path::Path::new(&path).extension()?.to_str()?.to_lowercase();
+            let prog_id: String = RegKey::predef(HKEY_CURRENT_USER)
+                .open_subkey(format!(
+                    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.{ext}\\UserChoice"
+                ))
+                .ok()?
+                .get_value("ProgId")
+                .ok()?;
+            let cmd: String = RegKey::predef(HKEY_CLASSES_ROOT)
+                .open_subkey(format!("{prog_id}\\shell\\open\\command"))
+                .ok()?
+                .get_value("")
+                .ok()?;
+            // first token: quoted or bare exe path
+            let exe = if let Some(rest) = cmd.strip_prefix('"') {
+                rest.split('"').next()?.to_string()
+            } else {
+                cmd.split_whitespace().next()?.to_string()
+            };
+            let stem = std::path::Path::new(&exe).file_stem()?.to_str()?.to_string();
+            let args = player_seek_args(&stem, &path, ts_ms)?;
+            Some((exe, args))
+        })();
+        if let Some((exe, args)) = assoc {
+            return std::process::Command::new(exe)
+                .args(args)
+                .spawn()
+                .map(|_| ())
+                .map_err(err_str);
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let desktop = std::process::Command::new("xdg-mime")
+            .args(["query", "default", "video/mp4"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
+            .unwrap_or_default();
+        for player in ["mpv", "vlc"] {
+            if desktop.contains(player) {
+                if let Some(args) = player_seek_args(player, &path, ts_ms) {
+                    if std::process::Command::new(player).args(&args).spawn().is_ok() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    // macOS and unknown players: plain open with the default app (no seek —
+    // stock players expose no public jump interface)
+    let _ = ts_ms;
+    open_default(Path::new(&path), "a video")
+}
+
+/// Poll the clipboard once a second while enabled; embed new clips inline
+/// when the model is free. Owns its DB connection.
+fn spawn_clip_watcher(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if state.clip_thread_alive.swap(true, Ordering::SeqCst) {
+        return; // already running; it reads clip_watch every tick
+    }
+    let run = state.clip_watch.clone();
+    let alive = state.clip_thread_alive.clone();
+    let db_path = state.db_path.clone();
+    let embedder = state.embedder.clone();
+    let siglip = state.siglip.clone();
+    let store = state.store.clone();
+    let clip_app = app.clone();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let conn = db::open(&db_path)?;
+            let mut watcher = clips::ClipboardWatcher::new()?;
+            let mut ticks: u64 = 0;
+            while run.load(Ordering::SeqCst) {
+                let mut recorded = false;
+                if let Some(text) = watcher.poll() {
+                    let now = unix_now();
+                    if clips::record_clip(&conn, &text, now, clips::DEFAULT_MAX_LEN)
+                        .unwrap_or(false)
+                    {
+                        recorded = true;
+                        // embed immediately when the model isn't busy
+                        if let Ok(mut guard) = embedder.try_lock() {
+                            if let Some(e) = guard.as_mut() {
+                                let _ = clips::embed_pending_clips(&conn, e, |_, _| {});
+                            }
+                        }
+                    }
+                } else if let Some((w, h, rgba)) = watcher.poll_image() {
+                    // screenshots and copied images join the history too,
+                    // searchable by describing what's in them
+                    let hash = clips::sample_hash(w, h, &rgba);
+                    if let Some((jpeg, thumb, iw, ih)) = clips::encode_clipboard_image(w, h, &rgba)
+                    {
+                        if clips::record_image_clip(&conn, &hash, &jpeg, &thumb, iw, ih, unix_now())
+                            .unwrap_or(false)
+                        {
+                            recorded = true;
+                            let mut loaded = false;
+                            if let Ok(mut guard) = siglip.try_lock() {
+                                if let Some(s) = guard.as_mut() {
+                                    loaded = true;
+                                    let _ = clips::embed_pending_image_clips(&conn, s);
+                                }
+                            }
+                            if !loaded {
+                                // the first image clip: an idle model loads
+                                // now and its catch-up embeds this one
+                                ensure_image_model(&clip_app);
+                            }
+                        }
+                    }
+                }
+                if recorded {
+                    let cap = db::meta_get(&conn, "clip_max_entries")
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0u32);
+                    let _ = clips::prune_clips_to_count(&conn, cap);
+                    reload_store(&db_path, &store);
+                }
+                ticks += 1;
+                if ticks.is_multiple_of(3600) {
+                    let days = db::meta_get(&conn, "clip_retention_days")
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(30u32);
+                    let _ = clips::prune_clips(&conn, days, unix_now());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            log::error!("clipboard watcher stopped: {e}");
+        }
+        alive.store(false, Ordering::SeqCst);
+    });
+}
+
+// ---------- bookmarks ----------
+
+/// Unified web search over bookmarks and/or history. `scope` is one of
+/// "all" | "bookmarks" | "history"; results are tagged and merged by score.
+#[tauri::command]
+async fn search_web(
+    state: State<'_, AppState>,
+    query: String,
+    scope: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let scope = scope.unwrap_or_else(|| "all".into());
+    let limit = limit.unwrap_or(40);
+    let qvec = if query.trim().is_empty() {
+        None
+    } else {
+        match state.embedder.try_lock() {
+            Ok(mut g) => g.as_mut().and_then(|e| e.embed_query(&query).ok()),
+            Err(_) => None,
+        }
+    };
+    let Some(conn) = take_state_search_conn(&state).await else {
+        return Ok(Vec::new()); // superseded; the frontend drops stale answers
+    };
+    let store = state.store.lock().unwrap();
+    rank_web(&conn, &store, &query, qvec.as_deref(), &scope, limit).map_err(err_str)
+}
+
+/// At most this many web hits found by meaning alone, and only when no hit
+/// shares a word with the query. e5-small cannot tell a related bookmark
+/// from an unrelated one by similarity on short titles (measured with
+/// `examples/verify_web_floor.rs`: related median 0.844, unrelated up to
+/// 0.854), so these are few, last, and labelled "maybe related".
+const WEB_FUZZY_MAX: usize = 3;
+
+/// Bookmark and history hits as the palette ranks them (`scope`: "all",
+/// "bookmarks" or "history"). Shared with the MCP server.
+fn rank_web(
+    conn: &magpie_core::rusqlite::Connection,
+    store: &VectorStore,
+    query: &str,
+    qvec: Option<&[f32]>,
+    scope: &str,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let fb = magpie_core::frecency::factors(conn, "bookmark", unix_now()).unwrap_or_default();
+    let fh = magpie_core::frecency::factors(conn, "history", unix_now()).unwrap_or_default();
+    let mut out: Vec<(f32, bool, serde_json::Value)> = Vec::new(); // (score, fuzzy, hit)
+    if scope != "history" {
+        for b in search::search_bookmarks(conn, store, query, qvec, limit)? {
+            // curated bookmarks get a small edge over raw history at a tie;
+            // frecency nudges the ones the user actually reopens
+            let bonus = 0.01 * fb.get(&b.url).copied().unwrap_or(0.0);
+            let mut v = serde_json::to_value(&b)?;
+            v["kind"] = json!("bookmark");
+            out.push((b.score + 0.05 + bonus, b.fuzzy, v));
+        }
+    }
+    if scope != "bookmarks" {
+        for h in search::search_history(conn, store, query, qvec, limit)? {
+            let bonus = 0.01 * fh.get(&h.url).copied().unwrap_or(0.0);
+            let mut v = serde_json::to_value(&h)?;
+            v["kind"] = json!("history");
+            out.push((h.score + bonus, h.fuzzy, v));
+        }
+    }
+    out.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let cap = if out.iter().any(|(_, fuzzy, _)| !fuzzy) {
+        out.retain(|(_, fuzzy, _)| !fuzzy);
+        limit
+    } else {
+        limit.min(WEB_FUZZY_MAX)
+    };
+    Ok(out.into_iter().take(cap).map(|(_, _, v)| v).collect())
+}
+
+/// Re-read every browser's bookmark and history store and refresh vectors.
+fn spawn_bookmark_sync(app: AppHandle) {
+    let state = app.state::<AppState>();
+    let embedder = state.embedder.clone();
+    let db_path = state.db_path.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+            let conn = db::open(&db_path)?;
+            let report = bookmarks::sync_bookmarks(&conn)?;
+            let hist_report = history::sync_history(&conn)?;
+            let embedded = match embedder.try_lock() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(e) => {
+                        let b = bookmarks::embed_pending_bookmarks(&conn, e, |_, _| {})?;
+                        let h = history::embed_pending_history(&conn, e, |_, _| {})?;
+                        b + h
+                    }
+                    None => 0, // model not ready; catch-up covers it
+                },
+                Err(_) => 0, // busy embedding elsewhere; next sync catches up
+            };
+            Ok(json!({ "report": report, "history": hist_report, "embedded": embedded }))
+        })
+        .await;
+        match outcome {
+            Ok(Ok(v)) => {
+                {
+                    let state = app.state::<AppState>();
+                    reload_store(&state.db_path, &state.store);
+                }
+                let _ = app.emit("bookmarks-done", v);
+            }
+            Ok(Err(e)) => {
+                log::warn!("bookmark sync failed: {e:#}");
+                let _ = app.emit("bookmarks-error", e.to_string());
+            }
+            Err(e) => {
+                log::warn!("bookmark sync task panicked: {e}");
+                let _ = app.emit("bookmarks-error", e.to_string());
+            }
+        }
+    });
+}
+
+/// The browsers the Web tab reads, with how many bookmarks and history pages
+/// each contributed, most first (Settings › Web).
+#[tauri::command(async)]
+fn web_sources(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT browser, SUM(b), SUM(h) FROM (
+                 SELECT browser, COUNT(*) AS b, 0 AS h FROM bookmarks GROUP BY browser
+                 UNION ALL
+                 SELECT browser, 0, COUNT(*) FROM history GROUP BY browser)
+             GROUP BY browser ORDER BY SUM(b) + SUM(h) DESC, browser",
+        )
+        .map_err(err_str)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(json!({
+                "browser": r.get::<_, String>(0)?,
+                "bookmarks": r.get::<_, i64>(1)?,
+                "history": r.get::<_, i64>(2)?,
+            }))
+        })
+        .map_err(err_str)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(err_str)
+}
+
+#[tauri::command]
+fn sync_bookmarks_now(app: AppHandle) -> Result<(), String> {
+    spawn_bookmark_sync(app);
+    Ok(())
+}
+
+/// Wipe the whole star index (repos, READMEs, vectors) and sync from zero.
+#[tauri::command]
+async fn rebuild_stars(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state.sync_running.load(Ordering::SeqCst) {
+        return Err("sync is running; try again when it finishes".into());
+    }
+    {
+        let conn = state.db.lock().await;
+        conn.execute("DELETE FROM repos", []).map_err(err_str)?;
+    }
+    spawn_sync(app);
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let allowed = {
+        let conn = state.db.lock().await;
+        files::path_is_allowed(&conn, &path).map_err(err_str)?
+    };
+    if !allowed {
+        return Err("path is outside indexed folders".into());
+    }
+    // reveal in Explorer / Finder rather than executing the file
+    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(err_str)
+}
+
+/// What a local index pass looks at.
+enum Scope {
+    /// Every registered folder: the full walk, which also prunes what is gone.
+    All,
+    /// Only these paths, as the file watcher reported them (see `watch`).
+    Paths(Vec<PathBuf>),
+}
+
+/// A full walk, now or right after the pass that is running: that pass may
+/// have read the folder list before this request (two folders added in a
+/// row, say), so the request is queued, not dropped. The watch ticker runs
+/// it once the indexer is free.
+fn spawn_local_index(app: AppHandle) {
+    if !start_local_index(app.clone(), Scope::All) {
+        app.state::<AppState>().pending.lock().unwrap().rescan_all(std::time::Instant::now());
+    }
+}
+
+/// Scan (full or scoped), then embed whatever the scan left pending. One
+/// pass at a time: returns false when one is already running, so a caller
+/// with changes to report can queue them for later.
+fn start_local_index(app: AppHandle, scope: Scope) -> bool {
+    let state = app.state::<AppState>();
+    if state.local_indexing.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let running = state.local_indexing.clone();
+    let file_passes = state.file_embedding_passes.clone();
+    let embedder = state.embedder.clone();
+    let siglip = state.siglip.clone();
+    let db_path = state.db_path.clone();
+    let store = state.store.clone();
+    tauri::async_runtime::spawn(async move {
+        let app2 = app.clone();
+        let store_path = db_path.clone();
+        let outcome = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+            let conn = db::open(&db_path)?;
+            let scan_app = app2.clone();
+            let progress = move |scanned| {
+                let _ = scan_app.emit("local-progress", json!({ "stage": "scan", "done": scanned }));
+            };
+            let report = match &scope {
+                Scope::All => files::index_folders(&conn, progress)?,
+                Scope::Paths(paths) => files::index_changed(&conn, paths, progress)?,
+            };
+            // STEP7_NATIVE_VISION_GUI: bounded macOS OCR before text embedding.
+            // Existing GUI scan/watcher commands call this path; all OCR stays on-device.
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(resources) = app2.path().resource_dir() {
+                    let helpers = resources.join("native-ocr");
+                    match local_vision::after_scan(&conn, &helpers, |stage, done, total| {
+                        let _ = app2.emit(
+                            "local-progress",
+                            json!({"stage": stage, "done": done, "total": total}),
+                        );
+                    }) {
+                        Ok(summary) if summary.attempted > 0 => {
+                            log::info!(
+                                "native Vision OCR: {} attempted, {} indexed, {} failed",
+                                summary.attempted, summary.indexed, summary.failed
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => log::warn!("native Vision OCR batch skipped: {err:#}"),
+                    }
+                }
+            }
+            // the scan may have brought the first images or videos in: start
+            // the image model now; its own catch-up embeds the images
+            ensure_image_model(&app2);
+            // a background pass holding the model (the first launch's history
+            // catch-up, a stars sync) hands it over at its next batch
+            use magpie_core::threads::Model;
+            let embedded = match lock_model(&embedder, Model::Text).as_mut() {
+                Some(e) => {
+                    let _active = FileEmbeddingPass::start(file_passes.clone());
+                    files::embed_pending_files(&conn, e, |done, total| {
+                        let _ = app2.emit(
+                            "local-progress",
+                            json!({ "stage": "embed", "done": done, "total": total }),
+                        );
+                    })?
+                },
+                None => 0,
+            };
+            let images = match lock_model(&siglip, Model::Image).as_mut() {
+                Some(s) => files::embed_pending_images(&conn, s, |done, total| {
+                    let _ = app2.emit(
+                        "local-progress",
+                        json!({ "stage": "embed-images", "done": done, "total": total }),
+                    );
+                })?,
+                None => 0, // siglip not ready; catch-up runs after its init
+            };
+            Ok(json!({ "report": report, "embedded": embedded, "images": images }))
+        })
+        .await;
+        reload_store(&store_path, &store);
+        running.store(false, Ordering::SeqCst);
+        match outcome {
+            Ok(Ok(v)) => {
+                // the pass may have brought the first images or videos in;
+                // the model's own catch-up then embeds them
+                ensure_image_model(&app);
+                let _ = app.emit("local-done", v);
+            }
+            Ok(Err(e)) => {
+                log::warn!("local index failed: {e:#}");
+                let _ = app.emit("local-error", e.to_string());
+            }
+            Err(e) => {
+                log::warn!("local index task panicked: {e}");
+                let _ = app.emit("local-error", e.to_string());
+            }
+        }
+    });
+    true
+}
+
+// ---------- sync orchestration ----------
+
+fn spawn_sync(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if state.sync_running.swap(true, Ordering::SeqCst) {
+        return; // already running
+    }
+    let running = state.sync_running.clone();
+    let embedder = state.embedder.clone();
+    let db_path = state.db_path.clone();
+    let store = state.store.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = run_sync(app.clone(), db_path.clone(), embedder).await;
+        reload_store(&db_path, &store);
+        running.store(false, Ordering::SeqCst);
+        match outcome {
+            Ok(v) => {
+                let _ = app.emit("sync-done", v);
+            }
+            Err(e) => {
+                log::warn!("star sync failed: {e:#}");
+                let _ = app.emit("sync-error", e.to_string());
+            }
+        }
+    });
+}
+
+async fn run_sync(
+    app: AppHandle,
+    db_path: PathBuf,
+    embedder: Arc<StdMutex<Option<Embedder>>>,
+) -> Result<serde_json::Value> {
+    // own connection: WAL lets the search connection keep reading meanwhile
+    let mut conn = db::open(&db_path)?;
+    let Some(token) = db::meta_get(&conn, "token")? else {
+        // fresh install, nothing to sync yet — not an error
+        return Ok(json!({ "skipped": "no_token" }));
+    };
+    let client = GithubClient::new(&token)?;
+
+    let progress_app = app.clone();
+    let report = sync::sync(&mut conn, &client, move |p| {
+        let _ = progress_app.emit("sync-progress", &p);
+    })
+    .await?;
+    drop(conn);
+
+    let embedded = {
+        let progress_app = app.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db::open(&db_path)?;
+            // a first sync embeds thousands of READMEs: rounds, so a local
+            // index pass waiting for the model gets it in between
+            run_yielding(magpie_core::threads::Model::Text, || {
+                let mut guard = embedder.lock().unwrap();
+                match guard.as_mut() {
+                    Some(e) => sync::embed_pending(&conn, e, |p| {
+                        let _ = progress_app.emit("sync-progress", &p);
+                    }),
+                    None => Ok(0), // model not ready; embed_pending reruns after init
+                }
+            })
+        })
+        .await??
+    };
+
+    Ok(json!({ "report": report, "embedded": embedded }))
+}
+
+/// Text model status while semantic search is off or not chosen yet (#8).
+const MODEL_OFF: &str = "off";
+/// Text model status while semantic search is paused to free memory.
+const MODEL_PAUSED: &str = "paused";
+
+/// Semantic search on, off, or not chosen yet (a fresh install before the
+/// welcome screen). Read each time: a switch in settings applies at once.
+fn semantic_choice(state: &AppState) -> magpie_core::semantic::Choice {
+    db::open(&state.db_path)
+        .ok()
+        .and_then(|c| magpie_core::semantic::choice(&c, &state.model_dir).ok())
+        .unwrap_or(magpie_core::semantic::Choice::On)
+}
+
+/// May a model load now? Not while semantic search is off, undecided or
+/// paused.
+fn models_allowed(state: &AppState) -> bool {
+    !state.models_paused.load(Ordering::SeqCst)
+        && semantic_choice(state) == magpie_core::semantic::Choice::On
+}
+
+/// The text model's status when it may not load, for the settings row.
+fn blocked_status(state: &AppState) -> &'static str {
+    if state.models_paused.load(Ordering::SeqCst) {
+        MODEL_PAUSED
+    } else {
+        MODEL_OFF
+    }
+}
+
+/// Drop both models from memory. Passes holding one end at their next item
+/// (the stop flags) so the lock comes free; after a reload their catch-up
+/// carries on where they stopped.
+fn unload_models(state: &AppState) {
+    use magpie_core::threads::{self as th, Model};
+    th::stop(Model::Text);
+    th::stop(Model::Image);
+    let text = lock_model(&state.embedder, Model::Text).take();
+    let image = lock_model(&state.siglip, Model::Image).take();
+    th::resume(Model::Text);
+    th::resume(Model::Image);
+    drop((text, image));
+}
+
+/// Pause semantic search and free the models' memory (#8), for a game or
+/// another program that needs it; or resume, loading them again. Search
+/// runs on keywords while paused. Not remembered: a restart resumes. Not
+/// resumed by a search either: launching the game from the box would load
+/// the models straight back. Blocking: a pause waits for a pass that holds
+/// a model to reach its next item.
+fn pause_models_now(app: &AppHandle, pause: bool) {
+    let state = app.state::<AppState>();
+    if semantic_choice(&state) != magpie_core::semantic::Choice::On {
+        return; // off or undecided: nothing is loaded, nothing to resume
+    }
+    if pause {
+        state.models_paused.store(true, Ordering::SeqCst);
+        unload_models(&state);
+        *state.model_status.lock().unwrap() = MODEL_PAUSED.into();
+        *state.siglip_status.lock().unwrap() = IMAGE_MODEL_IDLE.into();
+        let _ = app.emit("model-status", MODEL_PAUSED);
+        log::info!("semantic search paused; models unloaded");
+    } else if state.models_paused.swap(false, Ordering::SeqCst) {
+        log::info!("semantic search resumed");
+        spawn_model_init(app.clone());
+        ensure_image_model(app);
+    }
+    refresh_tray(app);
+}
+
+#[tauri::command(async)]
+fn pause_semantic(app: AppHandle, pause: bool) -> Result<(), String> {
+    pause_models_now(&app, pause);
+    Ok(())
+}
+
+/// Turn semantic search on or off (settings, the welcome screen). Off frees
+/// the models and keeps them from downloading or loading; on loads the text
+/// model (downloading it the first time) and the image model if anything
+/// needs it.
+#[tauri::command(async)]
+fn set_semantic(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    {
+        let conn = db::open(&state.db_path).map_err(err_str)?;
+        magpie_core::semantic::set(&conn, enabled).map_err(err_str)?;
+    }
+    apply_semantic(&app, enabled);
+    Ok(())
+}
+
+/// Make the stored semantic choice real: load, or unload and keep off.
+/// Blocking when it unloads (a pass holding a model finishes its item).
+fn apply_semantic(app: &AppHandle, enabled: bool) {
+    let state = app.state::<AppState>();
+    log::info!("semantic search {}", if enabled { "on" } else { "off" });
+    state.models_paused.store(false, Ordering::SeqCst);
+    if enabled {
+        spawn_model_init(app.clone());
+        ensure_image_model(app);
+    } else {
+        unload_models(&state);
+        *state.model_status.lock().unwrap() = MODEL_OFF.into();
+        *state.siglip_status.lock().unwrap() = IMAGE_MODEL_IDLE.into();
+        let _ = app.emit("model-status", MODEL_OFF);
+    }
+    refresh_tray(app);
+}
+
+/// Load the embedding model in the background, then embed anything pending.
+fn spawn_model_init(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if !models_allowed(&state) {
+        let s = blocked_status(&state);
+        *state.model_status.lock().unwrap() = s.into();
+        let _ = app.emit("model-status", s);
+        return;
+    }
+    if state.model_initing.swap(true, Ordering::SeqCst) {
+        return; // an init is already running; model_reinit may queue a rerun
+    }
+    let embedder = state.embedder.clone();
+    let status = state.model_status.clone();
+    let model_dir = state.model_dir.clone();
+    let db_path = state.db_path.clone();
+    let store = state.store.clone();
+    let initing = state.model_initing.clone();
+    let reinit = state.model_reinit.clone();
+    let threads = index_threads(&db_path);
+    tauri::async_runtime::spawn(async move {
+        *status.lock().unwrap() = "loading".into();
+        let _ = app.emit("model-status", "loading");
+        let init = tokio::task::spawn_blocking({
+            let model_dir = model_dir.clone();
+            let status = status.clone();
+            let app = app.clone();
+            move || {
+                let mut last = String::new();
+                Embedder::new_with_fallback(&model_dir, threads, &mut |msg| {
+                    // percent strings repeat per read; only surface changes
+                    if msg != last {
+                        last = msg.clone();
+                        *status.lock().unwrap() = msg.clone();
+                        let _ = app.emit("model-status", msg);
+                    }
+                })
+            }
+        })
+        .await;
+        // Store it under the model's lock, checking under that same lock that
+        // it may still load: a pause sets its flag first and then takes this
+        // lock to unload, so it either sees the model stored or this sees the
+        // flag. Checked before taking the lock, a pause landing in between
+        // found nothing to unload and the model stayed in memory (T34).
+        let kept = match init {
+            Ok(Ok(e)) => {
+                let mut slot = embedder.lock().unwrap();
+                if models_allowed(&app.state::<AppState>()) {
+                    *slot = Some(e);
+                    Ok(Ok(true))
+                } else {
+                    Ok(Ok(false)) // switched off or paused while it loaded
+                }
+            }
+            Ok(Err(e)) => Ok(Err(e)),
+            Err(e) => Err(e),
+        };
+        match kept {
+            Ok(Ok(false)) => {
+                let s = blocked_status(&app.state::<AppState>());
+                *status.lock().unwrap() = s.into();
+                let _ = app.emit("model-status", s);
+                reinit.store(false, Ordering::SeqCst);
+                initing.store(false, Ordering::SeqCst);
+            }
+            Ok(Ok(true)) => {
+                *status.lock().unwrap() = "ready".into();
+                log::info!("semantic model ready ({threads} threads)");
+                let _ = app.emit("model-status", "ready");
+                initing.store(false, Ordering::SeqCst);
+                // a load-time setting (thread cap, mirror) changed while this
+                // load ran: load once more before catching up, so the
+                // catch-up runs on the final session. The passes stay
+                // stopped until that load has swapped its session in.
+                if reinit.swap(false, Ordering::SeqCst) {
+                    spawn_model_init(app.clone());
+                    return;
+                }
+                magpie_core::threads::resume(magpie_core::threads::Model::Text);
+                if WORK_SAFE {
+                    log::info!("WORK_SAFE: text model loaded; automatic embedding queue disabled");
+                    return;
+                }
+                // catch up on vectors for repos/files ingested while the model was absent
+                let app2 = app.clone();
+                let catchup_path = db_path.clone();
+                let file_passes = app.state::<AppState>().file_embedding_passes.clone();
+                let done = tokio::task::spawn_blocking(move || -> Result<usize> {
+                    let conn = db::open(&catchup_path)?;
+                    // minutes of work on a first launch (browser history):
+                    // done in rounds that give the model to a waiting pass
+                    run_yielding(magpie_core::threads::Model::Text, || {
+                        let mut guard = embedder.lock().unwrap();
+                        let Some(e) = guard.as_mut() else { return Ok(0) };
+                        let repos = sync::embed_pending(&conn, e, |p| {
+                            let _ = app2.emit("sync-progress", &p);
+                        })?;
+                        let files_n = {
+                            let _active = FileEmbeddingPass::start(file_passes.clone());
+                            files::embed_pending_files(&conn, e, |done, total| {
+                                if total > 0 {
+                                    let _ = app2.emit(
+                                        "local-progress",
+                                        json!({ "stage": "embed", "done": done, "total": total }),
+                                    );
+                                }
+                            })?
+                        };
+                        let bm = bookmarks::embed_pending_bookmarks(&conn, e, |_, _| {})?;
+                        let hi = history::embed_pending_history(&conn, e, |_, _| {})?;
+                        let cl = clips::embed_pending_clips(&conn, e, |_, _| {})?;
+                        Ok(repos + files_n + bm + hi + cl)
+                    })
+                })
+                .await;
+                reload_store(&db_path, &store);
+                // close out any progress state the catch-up opened; without
+                // these the UI spinner never stops
+                let _ = app.emit("sync-done", json!({ "catchup": true }));
+                let _ = app.emit("local-done", json!({ "catchup": true }));
+                if let Ok(Ok(n)) = done {
+                    if n > 0 {
+                        let _ = app.emit("embed-caught-up", n);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                log::error!("semantic model init failed: {e}");
+                let msg = format!("failed: {e}");
+                *status.lock().unwrap() = msg.clone();
+                let _ = app.emit("model-status", msg);
+                initing.store(false, Ordering::SeqCst);
+                // whatever model is loaded stays in use; let its passes run
+                magpie_core::threads::resume(magpie_core::threads::Model::Text);
+                if reinit.swap(false, Ordering::SeqCst) {
+                    // a setting changed while this attempt ran; try once more
+                    spawn_model_init(app.clone());
+                }
+            }
+            Err(e) => {
+                log::error!("semantic model init task panicked: {e}");
+                let msg = format!("failed: {e}");
+                *status.lock().unwrap() = msg.clone();
+                let _ = app.emit("model-status", msg);
+                initing.store(false, Ordering::SeqCst);
+                magpie_core::threads::resume(magpie_core::threads::Model::Text);
+            }
+        }
+    });
+}
+
+/// Load the OCR models in the background (downloading on first run), then
+/// sweep any images that are waiting for text extraction.
+fn spawn_ocr_init(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if state.ocr_initing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let ocr = state.ocr.clone();
+    let status = state.ocr_status.clone();
+    let model_dir = state.model_dir.clone();
+    let initing = state.ocr_initing.clone();
+    let reinit = state.ocr_reinit.clone();
+    let model_id = db::open(&state.db_path)
+        .ok()
+        .and_then(|c| db::meta_get(&c, "ocr_model").ok().flatten())
+        .filter(|m| magpie_core::ocr::is_known_model(m))
+        .unwrap_or_else(|| magpie_core::ocr::OCR_MODEL_ID.into());
+    let threads = index_threads(&state.db_path);
+    tauri::async_runtime::spawn(async move {
+        *status.lock().unwrap() = "loading".into();
+        let init = tokio::task::spawn_blocking({
+            let model_dir = model_dir.clone();
+            let status = status.clone();
+            let app = app.clone();
+            move || {
+                let mut last = String::new();
+                magpie_core::ocr::Ocr::new_with_model(&model_dir, &model_id, threads, &mut |msg| {
+                    if msg != last {
+                        last = msg.clone();
+                        *status.lock().unwrap() = msg.clone();
+                        let _ = app.emit("model-status", msg);
+                    }
+                })
+            }
+        })
+        .await;
+        match init {
+            Ok(Ok(engine)) => {
+                // the user may have toggled OCR off while the download ran;
+                // installing the engine anyway would keep extracting forever
+                let still_on = {
+                    let state = app.state::<AppState>();
+                    db::open(&state.db_path)
+                        .ok()
+                        .and_then(|c| db::meta_get(&c, "ocr_enabled").ok().flatten())
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                };
+                if still_on {
+                    *ocr.lock().unwrap() = Some(engine);
+                    *status.lock().unwrap() = "ready".into();
+                    log::info!("ocr engine ready");
+                    spawn_ocr_index(app.clone());
+                } else {
+                    *status.lock().unwrap() = String::new();
+                }
+            }
+            Ok(Err(e)) => {
+                log::error!("ocr init failed: {e}");
+                *status.lock().unwrap() = format!("failed: {e}");
+            }
+            Err(e) => {
+                log::error!("ocr init task panicked: {e}");
+                *status.lock().unwrap() = format!("failed: {e}");
+            }
+        }
+        initing.store(false, Ordering::SeqCst);
+        // a load-time setting changed while this load ran: once more
+        if reinit.swap(false, Ordering::SeqCst) {
+            spawn_ocr_init(app.clone());
+        }
+    });
+}
+
+/// Extract text from indexed images that OCR hasn't seen yet (or whose file
+/// changed since). Updates `files.content`, which flows into FTS via the
+/// existing triggers and into the e5 space on the next embed pass.
+fn spawn_ocr_index(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if state.ocr_indexing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let ocr = state.ocr.clone();
+    let db_path = state.db_path.clone();
+    let indexing = state.ocr_indexing.clone();
+    tauri::async_runtime::spawn(async move {
+        let worked = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db::open(&db_path)?;
+            let exts = "'jpg','jpeg','png','webp','bmp','gif'";
+            let pending: Vec<(i64, String, i64)> = {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT id, path, mtime FROM files
+                     WHERE lower(ext) IN ({exts})
+                       AND (ocr_mtime IS NULL OR ocr_mtime != mtime)"
+                ))?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })?;
+                rows.collect::<magpie_core::rusqlite::Result<Vec<_>>>()?
+            };
+            let mut done = 0usize;
+            for (id, path, mtime) in pending {
+                // engine gone (setting turned off) — stop quietly
+                let text = match ocr.lock().unwrap().as_mut() {
+                    Some(engine) => {
+                        match engine.extract_text_from_path(std::path::Path::new(&path)) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                // unreadable file or inference error: log,
+                                // mark attempted, move on
+                                log::warn!("ocr {path}: {e}");
+                                String::new()
+                            }
+                        }
+                    }
+                    None => return Ok(done),
+                };
+                if text.trim().is_empty() {
+                    // nothing readable: only record the attempt
+                    conn.execute(
+                        "UPDATE files SET ocr_mtime = ?2 WHERE id = ?1",
+                        magpie_core::rusqlite::params![id, mtime],
+                    )?;
+                } else {
+                    conn.execute(
+                        "UPDATE files SET content = ?2, ocr_mtime = ?3 WHERE id = ?1",
+                        magpie_core::rusqlite::params![id, text, mtime],
+                    )?;
+                }
+                done += 1;
+            }
+            // scanned PDFs, only when the user opted in (large scans are
+            // slow): pdf-inspector routes which pages need OCR, we pull each
+            // such page's embedded scan image and read it. Native text-layer
+            // markdown and OCR text land in `content` together.
+            let pdf_on = db::meta_get(&conn, "ocr_pdf")
+                .ok()
+                .flatten()
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if pdf_on {
+                let pdfs: Vec<(i64, String, i64)> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, path, mtime FROM files
+                         WHERE lower(ext) = 'pdf'
+                           AND (ocr_mtime IS NULL OR ocr_mtime != mtime)",
+                    )?;
+                    let rows = stmt.query_map([], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                    })?;
+                    rows.collect::<magpie_core::rusqlite::Result<Vec<_>>>()?
+                };
+                for (id, path, mtime) in pdfs {
+                    let text = match ocr.lock().unwrap().as_mut() {
+                        Some(engine) => {
+                            let p = std::path::Path::new(&path);
+                            match files::pdf_ocr_plan(p) {
+                                Some((pages, native)) if !pages.is_empty() => {
+                                    let mut parts = vec![native];
+                                    for img in files::pdf_page_images(p, &pages, 50) {
+                                        match engine.extract_text(&img) {
+                                            Ok(t) if !t.trim().is_empty() => parts.push(t),
+                                            Ok(_) => {}
+                                            Err(e) => log::warn!("pdf ocr {path}: {e}"),
+                                        }
+                                    }
+                                    parts.join("\n").chars().take(2_000_000).collect()
+                                }
+                                // text-layer PDF or unreadable: nothing to add
+                                _ => String::new(),
+                            }
+                        }
+                        None => return Ok(done),
+                    };
+                    if text.trim().is_empty() {
+                        conn.execute(
+                            "UPDATE files SET ocr_mtime = ?2 WHERE id = ?1",
+                            magpie_core::rusqlite::params![id, mtime],
+                        )?;
+                    } else {
+                        conn.execute(
+                            "UPDATE files SET content = ?2, ocr_mtime = ?3 WHERE id = ?1",
+                            magpie_core::rusqlite::params![id, text, mtime],
+                        )?;
+                    }
+                    done += 1;
+                }
+            }
+            // then video shots: re-grab each unprocessed shot's frame at OCR
+            // resolution (960px — the stored thumbs are 96px) and read it
+            let decode = decode_opts_from_meta(&conn);
+            loop {
+                let batch = magpie_core::videos::pending_ocr_shots(&conn, 64)?;
+                if batch.is_empty() {
+                    break;
+                }
+                for (shot_id, path, ts_ms) in batch {
+                    let text = match ocr.lock().unwrap().as_mut() {
+                        Some(engine) => {
+                            match magpie_core::videos::frame_at_sized(&path, ts_ms, decode, 960)
+                                .and_then(|img| engine.extract_text(&img))
+                            {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    log::warn!("shot ocr {path}@{ts_ms}ms: {e}");
+                                    String::new() // mark attempted, move on
+                                }
+                            }
+                        }
+                        None => return Ok(done),
+                    };
+                    magpie_core::videos::set_shot_ocr(&conn, shot_id, &text)?;
+                    done += 1;
+                }
+            }
+            Ok(done)
+        })
+        .await;
+        if let Ok(Ok(n)) = worked {
+            if n > 0 {
+                log::info!("ocr pass extracted text for {n} image(s)");
+            }
+        }
+        indexing.store(false, Ordering::SeqCst);
+    });
+}
+
+/// SigLIP status while nothing needs it: not loaded, not loading. Issue #4:
+/// the model sat in memory for users who index no images at all.
+const IMAGE_MODEL_IDLE: &str = "idle";
+
+/// Load the image model if it is idle and something now needs it. Called
+/// wherever the need can appear: after an index pass (new images or videos),
+/// when an image lands on the clipboard history, and when the user searches
+/// by an image. A model that is loading, ready or failed is left alone.
+fn ensure_image_model(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    if !models_allowed(&state) || *state.siglip_status.lock().unwrap() != IMAGE_MODEL_IDLE {
+        return false;
+    }
+    let needed = db::open(&state.db_path)
+        .ok()
+        .and_then(|c| files::needs_image_model(&c).ok())
+        .unwrap_or(false);
+    if needed {
+        log::info!("image model needed now; loading it");
+        spawn_siglip_init(app.clone());
+    }
+    needed
+}
+
+/// Load SigLIP in the background, then embed any images that are waiting.
+fn spawn_siglip_init(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if !models_allowed(&state) {
+        // off, undecided or freed: idle, so ensure_image_model can bring it
+        // back once semantic search is on and something needs it
+        *state.siglip_status.lock().unwrap() = IMAGE_MODEL_IDLE.into();
+        return;
+    }
+    if state.siglip_initing.swap(true, Ordering::SeqCst) {
+        return; // an init is already running; siglip_reinit may queue a rerun
+    }
+    let siglip = state.siglip.clone();
+    let status = state.siglip_status.clone();
+    let model_dir = state.model_dir.clone();
+    let db_path = state.db_path.clone();
+    let store = state.store.clone();
+    let initing = state.siglip_initing.clone();
+    let reinit = state.siglip_reinit.clone();
+    let threads = index_threads(&db_path);
+    tauri::async_runtime::spawn(async move {
+        *status.lock().unwrap() = "loading".into();
+        let init = tokio::task::spawn_blocking({
+            let model_dir = model_dir.clone();
+            let status = status.clone();
+            let app = app.clone();
+            move || {
+                let mut last = String::new();
+                Siglip::new_with_progress(&model_dir, threads, &mut |msg| {
+                    if msg != last {
+                        last = msg.clone();
+                        *status.lock().unwrap() = msg.clone();
+                        let _ = app.emit("model-status", msg);
+                    }
+                })
+            }
+        })
+        .await;
+        // stored under the model's lock, checked under it (see spawn_model_init)
+        let kept = match init {
+            Ok(Ok(s)) => {
+                let mut slot = siglip.lock().unwrap();
+                if models_allowed(&app.state::<AppState>()) {
+                    *slot = Some(s);
+                    Ok(Ok(true))
+                } else {
+                    Ok(Ok(false)) // switched off or paused while it loaded
+                }
+            }
+            Ok(Err(e)) => Ok(Err(e)),
+            Err(e) => Err(e),
+        };
+        match kept {
+            Ok(Ok(false)) => {
+                *status.lock().unwrap() = IMAGE_MODEL_IDLE.into();
+                reinit.store(false, Ordering::SeqCst);
+                initing.store(false, Ordering::SeqCst);
+            }
+            Ok(Ok(true)) => {
+                *status.lock().unwrap() = "ready".into();
+                let _ = app.emit("model-status", "image-ready");
+                initing.store(false, Ordering::SeqCst);
+                // a load-time setting changed while this load ran: load once
+                // more before catching up (see spawn_model_init)
+                if reinit.swap(false, Ordering::SeqCst) {
+                    spawn_siglip_init(app.clone());
+                    return;
+                }
+                magpie_core::threads::resume(magpie_core::threads::Model::Image);
+                if WORK_SAFE {
+                    log::info!("WORK_SAFE: image model loaded; automatic embedding queue disabled");
+                    return;
+                }
+                let app2 = app.clone();
+                let catchup_path = db_path.clone();
+                let done = tokio::task::spawn_blocking(move || -> Result<usize> {
+                    let conn = db::open(&catchup_path)?;
+                    // rounds that give the model to a waiting index pass
+                    run_yielding(magpie_core::threads::Model::Image, || {
+                        match siglip.lock().unwrap().as_mut() {
+                            Some(s) => files::embed_pending_images(&conn, s, |done, total| {
+                                if total > 0 {
+                                    let _ = app2.emit(
+                                        "local-progress",
+                                        json!({ "stage": "embed-images", "done": done, "total": total }),
+                                    );
+                                }
+                            }),
+                            None => Ok(0),
+                        }
+                    })
+                })
+                .await;
+                reload_store(&db_path, &store);
+                let _ = app.emit("local-done", json!({ "catchup": true }));
+                if let Ok(Ok(n)) = done {
+                    if n > 0 {
+                        let _ = app.emit("embed-caught-up", n);
+                    }
+                }
+                // image model is up → catch up image clips, then sweep videos
+                {
+                    let siglip2 = app.state::<AppState>().siglip.clone();
+                    let path2 = db_path.clone();
+                    let store2 = store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(conn) = db::open(&path2) {
+                            // batches of 64 until none are left, in rounds
+                            // that give the model to a waiting index pass
+                            let _ = run_yielding(magpie_core::threads::Model::Image, || {
+                                let mut guard = siglip2.lock().unwrap();
+                                let Some(s) = guard.as_mut() else { return Ok(0) };
+                                let mut n = 0;
+                                loop {
+                                    let batch = clips::embed_pending_image_clips(&conn, s)?;
+                                    if batch == 0 {
+                                        return Ok(n);
+                                    }
+                                    n += batch;
+                                }
+                            });
+                        }
+                        reload_store(&path2, &store2);
+                    });
+                }
+                spawn_video_index(app.clone());
+            }
+            Ok(Err(e)) => {
+                let msg = format!("failed: {e}");
+                *status.lock().unwrap() = msg;
+                let _ = app.emit("model-status", "image-failed");
+                initing.store(false, Ordering::SeqCst);
+                // whatever model is loaded stays in use; let its passes run
+                magpie_core::threads::resume(magpie_core::threads::Model::Image);
+                if reinit.swap(false, Ordering::SeqCst) {
+                    spawn_siglip_init(app.clone());
+                }
+            }
+            Err(e) => {
+                let msg = format!("failed: {e}");
+                *status.lock().unwrap() = msg;
+                let _ = app.emit("model-status", "image-failed");
+                initing.store(false, Ordering::SeqCst);
+                magpie_core::threads::resume(magpie_core::threads::Model::Image);
+            }
+        }
+    });
+}
+
+// ---------- window / tray / shortcut ----------
+
+/// STEP17: cheap, durable aggregate status. The tooltip represents the
+/// entire index, not the number of items handled in the current session.
+fn indexing_tray_tooltip(conn: &magpie_core::rusqlite::Connection) -> Result<String> {
+    let files: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+    let text_total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE content IS NOT NULL", [], |r| r.get(0),
+    )?;
+    let pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM file_embed_jobs", [], |r| r.get(0),
+    )?;
+    let image_total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE lower(ext) IN ('jpg','jpeg','png','webp','bmp','gif')",
+        [], |r| r.get(0),
+    )?;
+    let image_done: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM image_embeddings", [], |r| r.get(0),
+    )?;
+    let text_errors: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM file_embed_jobs WHERE state='error'", [], |r| r.get(0),
+    )?;
+    let image_errors: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM image_embeddings WHERE dim=0", [], |r| r.get(0),
+    )?;
+    let text_done = text_total.saturating_sub(pending);
+    Ok(format!(
+        "LocalSearch — индекс\nФайлов: {files}\nТекст: {text_done}/{text_total} ({:.1}%)\nИзображения: {image_done}/{image_total}\nОжидают обработки: {pending}\nОшибки: текст {text_errors}, изображения {image_errors}",
+        if text_total > 0 { (text_done as f64) * 100.0 / text_total as f64 } else { 100.0 },
+    ))
+}
+
+fn spawn_tray_index_status(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut last = String::new();
+        loop {
+            if let Some(tray) = app.tray_by_id("main") {
+                let status = {
+                    let db_path = app.state::<AppState>().db_path.clone();
+                    db::open(&db_path).and_then(|conn| indexing_tray_tooltip(&conn))
+                };
+                if let Ok(text) = status {
+                    if text != last {
+                        if tray.set_tooltip(Some(text.as_str())).is_ok() {
+                            last = text;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    });
+}
+
+/// Retry transient model/IO failures without rescanning the filesystem.
+/// Jobs and retry times persist in SQLite across sleep and relaunch.
+fn spawn_failed_embed_retries(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
+            let db_path = app.state::<AppState>().db_path.clone();
+            let due = db::open(&db_path).ok().and_then(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM file_embed_jobs
+                     WHERE state='error'
+                       AND retry_at <= CAST(strftime('%s','now') AS INTEGER))",
+                    [], |r| r.get::<_, bool>(0),
+                ).ok()
+            }).unwrap_or(false);
+            if !due { continue; }
+            let embedder = app.state::<AppState>().embedder.clone();
+            let store = app.state::<AppState>().store.clone();
+            let worker_path = db_path.clone();
+            let worker_app = app.clone();
+            let file_passes = app.state::<AppState>().file_embedding_passes.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<usize> {
+                let conn = db::open(&worker_path)?;
+                let mut guard = lock_model(&embedder, magpie_core::threads::Model::Text);
+                let Some(model) = guard.as_mut() else { return Ok(0); };
+                let _active = FileEmbeddingPass::start(file_passes);
+                files::embed_pending_files(&conn, model, |done, total| {
+                    let _ = worker_app.emit(
+                        "local-progress",
+                        json!({ "stage": "embed", "done": done, "total": total }),
+                    );
+                })
+            }).await;
+            reload_store(&db_path, &store);
+            match result {
+                Ok(Err(e)) => log::warn!("step17 embedding retry failed: {e:#}"),
+                Err(e) => log::warn!("step17 embedding retry thread failed: {e}"),
+                _ => {}
+            }
+            let _ = app.emit("local-done", json!({ "retry": true }));
+        }
+    });
+}
+
+/// Tray labels for a UI language ("zh" or anything else = English).
+fn tray_labels(lang: &str) -> [&'static str; 4] {
+    if lang == "ru" {
+        ["Показать", "Синхронизировать", "Настройки…", "Выход"]
+    } else if lang == "zh" {
+        ["显示", "立即同步", "设置…", "退出"]
+    } else {
+        ["Show", "Sync now", "Settings…", "Quit"]
+    }
+}
+
+/// `update_version`: non-empty adds a "new version available" item on top.
+fn build_tray_menu(
+    app: &AppHandle,
+    lang: &str,
+    update_version: &str,
+) -> tauri::Result<Menu<tauri::Wry>> {
+    let l = tray_labels(lang);
+    let show = MenuItem::with_id(app, "show", l[0], true, None::<&str>)?;
+    let sync_item = MenuItem::with_id(app, "sync", l[1], true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, "settings", l[2], true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", l[3], true, None::<&str>)?;
+    // pause / resume semantic search (#8), only while it is switched on
+    let state = app.state::<AppState>();
+    let pause = if semantic_choice(&state) == magpie_core::semantic::Choice::On {
+        let paused = state.models_paused.load(Ordering::SeqCst);
+        let (id, label) = match (paused, lang) {
+            (false, "ru") => ("pause", "Приостановить поиск по смыслу"),
+            (true, "ru") => ("resume", "Возобновить поиск по смыслу"),
+            (false, "zh") => ("pause", "暂停语义搜索（释放内存）"),
+            (true, "zh") => ("resume", "恢复语义搜索"),
+            (false, _) => ("pause", "Pause semantic search (free memory)"),
+            (true, _) => ("resume", "Resume semantic search"),
+        };
+        Some(MenuItem::with_id(app, id, label, true, None::<&str>)?)
+    } else {
+        None
+    };
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&show, &sync_item, &settings_item];
+    if let Some(p) = &pause {
+        items.push(p);
+    }
+    items.push(&quit);
+    if update_version.is_empty() {
+        Menu::with_items(app, &items)
+    } else {
+        let label = if lang == "ru" {
+            format!("Доступна версия v{update_version}…")
+        } else if lang == "zh" {
+            format!("有新版本 v{update_version}…")
+        } else {
+            format!("Update available: v{update_version}…")
+        };
+        let upd = MenuItem::with_id(app, "update", &label, true, None::<&str>)?;
+        items.insert(0, &upd);
+        Menu::with_items(app, &items)
+    }
+}
+
+/// Sub-switch: also OCR scanned PDFs (pages pdf-inspector routes to OCR).
+/// Separate from the main toggle because large scans are slow — the user
+/// decides. Off by default.
+#[tauri::command]
+fn set_ocr_pdf(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    db::meta_set(&conn, "ocr_pdf", if enabled { "1" } else { "0" }).map_err(err_str)?;
+    if enabled {
+        spawn_ocr_index(app); // no-op until the engine is up
+    }
+    Ok(())
+}
+
+/// How the palette window's corners are drawn on Windows: "round" when the
+/// system rounds them (Windows 11), "square" when it cannot (Windows 10).
+/// Unset elsewhere: the panel's own CSS radius applies.
+static WINDOW_CORNERS: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// 节气 reminders on or off. Unset, they follow the interface language:
+/// on in Chinese, off in English (the verse means little untranslated).
+fn term_notify_on(conn: &magpie_core::rusqlite::Connection) -> bool {
+    match db::meta_get(conn, "term_notify").ok().flatten().as_deref() {
+        Some(v) => v == "1",
+        None => db::meta_get(conn, "ui_lang").ok().flatten().as_deref() == Some("zh"),
+    }
+}
+
+#[tauri::command]
+fn set_term_notify(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    db::meta_set(&conn, "term_notify", if enabled { "1" } else { "0" }).map_err(err_str)
+}
+
+/// On the first day of a solar term, once, from 09:00 on: a notification
+/// with a couplet for it. Checked a few seconds after start and every minute
+/// after, so a machine switched on at ten still gets it; a day magpie did not
+/// run is not made up. `MAGPIE_TEST_NOW` (`2026-10-08T09:30`) stands in for
+/// the clock and `MAGPIE_NOTIFY_DRYRUN` keeps the notification off screen.
+fn spawn_term_notices(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        loop {
+            check_term_notice(&app);
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
+fn check_term_notice(app: &AppHandle) {
+    let Ok(conn) = db::open(&app.state::<AppState>().db_path) else { return };
+    let last = db::meta_get(&conn, "term_notified").ok().flatten();
+    let clock = std::env::var("MAGPIE_TEST_NOW").ok();
+    let Some(n) = magpie_core::chinese_calendar::term_notice_now(clock.as_deref(), term_notify_on(&conn), last.as_deref()) else {
+        return;
+    };
+    // recorded first: a notification that fails is not retried every minute
+    if db::meta_set(&conn, "term_notified", &n.day).is_err() {
+        return;
+    }
+    log::info!("term notice: {}", n.term);
+    let _ = app.emit("term-notice", json!({ "term": n.term, "line": n.line, "source": n.source }));
+    if std::env::var_os("MAGPIE_NOTIFY_DRYRUN").is_none() {
+        show_term_notice(app, &n.term, n.line, n.source);
+    }
+}
+
+/// The reminder itself. On Windows a toast whose click opens the palette on
+/// `节气 <term>` (the verse again, with its date and source); elsewhere the
+/// notification plugin, where a click only brings the app forward.
+fn show_term_notice(app: &AppHandle, term: &str, line: &str, source: &str) {
+    let title = format!("今日{term}");
+    #[cfg(windows)]
+    {
+        // the app's own identity once installed; a dev build borrows
+        // PowerShell's, as the notification plugin does
+        const POWERSHELL_APP_ID: &str = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+        let installed = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+            .map(|d| !(d.ends_with("target/debug") || d.ends_with("target/release")))
+            .unwrap_or(false);
+        let id = if installed { app.config().identifier.clone() } else { POWERSHELL_APP_ID.to_string() };
+        let (a, query) = (app.clone(), format!("节气 {term}"));
+        let shown = magpie_core::toast::show(&id, &title, &[line, source], move || {
+            log::info!("term notice clicked");
+            let _ = a.emit("search-selection", query.clone());
+            show_window(&a);
+        });
+        if let Err(e) = shown {
+            log::warn!("term notice: {e:#}");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        use tauri_plugin_notification::NotificationExt;
+        let _ = app.notification().builder().title(&title).body(format!("{line}\n{source}")).show();
+    }
+}
+
+/// Toggle OCR text extraction for indexed images. Turning it on downloads
+/// the models (first run) and sweeps pending images; turning it off drops
+/// the engine — extracted text stays searchable until a folder rebuild.
+#[tauri::command]
+fn set_ocr(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+    model: String,
+) -> Result<(), String> {
+    if !magpie_core::ocr::is_known_model(&model) {
+        return Err(format!("unknown OCR model {model:?}"));
+    }
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    db::meta_set(&conn, "ocr_enabled", if enabled { "1" } else { "0" }).map_err(err_str)?;
+    db::meta_set(&conn, "ocr_model", &model).map_err(err_str)?;
+    if enabled {
+        // drop any loaded engine first: the model may have changed, and the
+        // index worker must not keep extracting with the old one meanwhile
+        *state.ocr.lock().unwrap() = None;
+        spawn_ocr_init(app);
+    } else {
+        *state.ocr.lock().unwrap() = None; // the index worker stops on its own
+        *state.ocr_status.lock().unwrap() = String::new();
+    }
+    Ok(())
+}
+
+/// Inline calculator / unit conversion / text transforms for the query box.
+/// None = the query is neither (the frontend shows plain search results).
+// async: runs on every keystroke, keep it off the main thread
+#[tauri::command(async)]
+fn calc_query(query: String) -> Option<serde_json::Value> {
+    if let Some(r) = magpie_core::calc::eval(&query) {
+        return Some(json!({ "value": r.value, "alt": r.alt }));
+    }
+    magpie_core::transform::transform(&query).map(|t| {
+        json!({ "value": t.value, "alt": t.label, "swatch": t.swatch, "error": t.error, "image": t.image, "timer": t.timer, "action": t.action, "badge": t.badge })
+    })
+}
+
+/// `ocr` alone in the box: the text in the image on the clipboard, shaped
+/// like a calculator hit (Enter copies it). The OCR engine is the one the
+/// user switched on in settings; when it is off, or no image is on the
+/// clipboard, the hit says so instead.
+#[tauri::command]
+async fn ocr_clipboard(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let status = state.ocr_status.lock().unwrap().clone();
+    if state.ocr.lock().unwrap().is_none() {
+        let why = if status.is_empty() || status.starts_with("failed") {
+            "Turn on Image text (OCR) in settings to read text from images"
+        } else {
+            "The OCR model is still getting ready"
+        };
+        return Ok(json!({ "value": why, "alt": "ocr", "error": true }));
+    }
+    let ocr = state.ocr.clone();
+    let text = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let img = clips::clipboard_image()?;
+        let mut guard = ocr.lock().unwrap();
+        let engine = guard.as_mut().ok_or_else(|| anyhow::anyhow!("OCR was switched off"))?;
+        engine.extract_text(&img)
+    })
+    .await
+    .map_err(err_str)?;
+    Ok(match text {
+        Ok(t) if !t.trim().is_empty() => {
+            let lines = t.trim().lines().count();
+            json!({ "value": t.trim(), "alt": format!("text in the copied image · {lines} lines") })
+        }
+        Ok(_) => json!({ "value": "No text found in the copied image", "alt": "ocr", "error": true }),
+        Err(e) => json!({ "value": capitalize(&e.to_string()), "alt": "ocr", "error": true }),
+    })
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
+/// `port 3000` / `kill :3000`: the processes listening on that port.
+#[tauri::command]
+async fn list_port_processes(port: u16) -> Result<Vec<magpie_core::procs::ProcHit>, String> {
+    tokio::task::spawn_blocking(move || magpie_core::procs::on_port(port))
+        .await
+        .map_err(err_str)?
+        .map_err(err_str)
+}
+
+/// Editors the action menu offers "Open in …" for, as their apps are named.
+const EDITORS: &[&str] = &["Visual Studio Code", "Cursor", "Trae", "Zed", "Sublime Text", "VSCodium", "Windsurf"];
+
+/// The editors from [`EDITORS`] that are installed: (name, app target).
+#[tauri::command]
+fn installed_editors(state: State<'_, AppState>) -> Vec<serde_json::Value> {
+    let apps = state.apps.lock().unwrap();
+    EDITORS
+        .iter()
+        .filter_map(|name| magpie_core::apps::app_named(&apps, name))
+        .map(|a| json!({ "name": a.name, "target": a.target }))
+        .collect()
+}
+
+/// Enter on a top row that carries an action (a typed path, the volume).
+/// The action is parsed and checked again here, whatever the page sent: a
+/// path is opened only if it exists, and a file is shown in its folder,
+/// never run.
+#[tauri::command(async)]
+fn run_action(app: AppHandle, action: String) -> Result<String, String> {
+    if let Some(p) = action.strip_prefix("open:") {
+        let path = std::path::Path::new(p);
+        let meta = std::fs::metadata(path).map_err(|_| "that path is not there any more".to_string())?;
+        if open_dry_run() {
+            return Ok(format!("dry run: {} {p}", if meta.is_dir() { "open folder" } else { "show file" }));
+        }
+        if meta.is_dir() {
+            open_default(path, "a typed folder")?;
+        } else {
+            tauri_plugin_opener::reveal_item_in_dir(path).map_err(err_str)?;
+        }
+        hide_palette(&app);
+        return Ok(format!("opened {p}"));
+    }
+    if let Some(n) = action.strip_prefix("volume:") {
+        let level: u8 = n.parse().map_err(|_| format!("not a volume: {n}"))?;
+        if level > 100 {
+            return Err(format!("not a volume: {n}"));
+        }
+        return magpie_core::volume::set_level(level).map_err(err_str);
+    }
+    if let Some(m) = action.strip_prefix("mute:") {
+        let muted = match m {
+            "true" => true,
+            "false" => false,
+            _ => return Err(format!("not a mute state: {m}")),
+        };
+        return magpie_core::volume::set_muted(muted).map_err(err_str);
+    }
+    Err(format!("unknown action {action:?}"))
+}
+
+/// `top` / `内存` (by memory) and `cpu` (by CPU, sampled over a moment):
+/// the heaviest processes, each with the total of its name.
+#[tauri::command(async)]
+fn top_processes(by: String) -> Vec<magpie_core::procs::ProcHit> {
+    use magpie_core::procs::TopBy;
+    magpie_core::procs::top(if by == "cpu" { TopBy::Cpu } else { TopBy::Memory }, 15)
+}
+
+/// Tests set `MAGPIE_OPEN_DRYRUN`: the openers below report what they would
+/// run or remove, and nothing appears on screen or moves to the trash.
+fn open_dry_run() -> bool {
+    std::env::var_os("MAGPIE_OPEN_DRYRUN").is_some()
+}
+
+async fn require_indexed(state: &AppState, path: &str) -> Result<(), String> {
+    let allowed = {
+        let conn = state.db.lock().await;
+        files::path_is_allowed(&conn, path).map_err(err_str)?
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err("path is outside indexed folders".into())
+    }
+}
+
+fn run_launch(app: &AppHandle, l: magpie_core::launch::Launch) -> Result<String, String> {
+    if open_dry_run() {
+        return Ok(format!("dry run: {l}"));
+    }
+    let r = magpie_core::launch::run(&l).map_err(err_str);
+    log_handoff("file in another program", "a file action", &r);
+    r?;
+    hide_palette(app);
+    Ok(String::new())
+}
+
+/// A terminal in the folder of an indexed file (or in the folder itself).
+#[tauri::command]
+async fn open_in_terminal(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<String, String> {
+    require_indexed(&state, &path).await?;
+    let dir = magpie_core::launch::folder_of(Path::new(&path));
+    let l = magpie_core::launch::terminal_at(&dir).map_err(err_str)?;
+    run_launch(&app, l)
+}
+
+/// An indexed file or folder in an installed editor. `editor` must be the
+/// app target of one of [`installed_editors`], so nothing else can be run.
+#[tauri::command]
+async fn open_in_editor(app: AppHandle, state: State<'_, AppState>, path: String, editor: String) -> Result<String, String> {
+    require_indexed(&state, &path).await?;
+    let known = {
+        let apps = state.apps.lock().unwrap();
+        EDITORS.iter().any(|n| magpie_core::apps::app_named(&apps, n).is_some_and(|a| a.target == editor))
+    };
+    if !known {
+        return Err("not an installed editor".into());
+    }
+    let l = magpie_core::launch::editor_with(&editor, Path::new(&path)).map_err(err_str)?;
+    run_launch(&app, l)
+}
+
+/// Every installed app, by name, for the "Edit with" picker in settings.
+#[tauri::command]
+fn app_choices(state: State<'_, AppState>) -> Vec<serde_json::Value> {
+    let apps = state.apps.lock().unwrap();
+    // a Store app cannot be handed a file to open this way: not offered
+    let mut v: Vec<&magpie_core::apps::AppEntry> =
+        apps.iter().filter(|a| !magpie_core::apps::is_store_app(&a.target)).collect();
+    v.sort_by_key(|a| a.name.to_lowercase());
+    v.dedup_by(|a, b| a.target == b.target);
+    v.into_iter().map(|a| json!({ "name": a.name, "target": a.target })).collect()
+}
+
+/// The "Edit with" table (#14): which app opens which file types on Ctrl+E.
+#[tauri::command]
+async fn get_edit_rules(state: State<'_, AppState>) -> Result<Vec<magpie_core::edit::RuleView>, String> {
+    let conn = state.db.lock().await;
+    let stored = db::meta_get(&conn, magpie_core::edit::META_KEY).map_err(err_str)?;
+    Ok(magpie_core::edit::view(magpie_core::edit::parse_rules(stored.as_deref())))
+}
+
+/// Save the table, extensions tidied. An app is kept as given, even one
+/// that is gone (uninstalled since, or from another computer's settings):
+/// refusing it would make the whole table unsavable. What may run is
+/// decided in [`edit_file`], which starts only apps on the installed list.
+#[tauri::command]
+async fn set_edit_rules(
+    state: State<'_, AppState>,
+    rules: Vec<magpie_core::edit::EditRule>,
+) -> Result<Vec<magpie_core::edit::RuleView>, String> {
+    let rules: Vec<magpie_core::edit::EditRule> = rules
+        .into_iter()
+        .map(|r| magpie_core::edit::EditRule { exts: magpie_core::edit::normalize_exts(&r.exts), app: r.app })
+        .collect();
+    let conn = state.db.lock().await;
+    db::meta_set(&conn, magpie_core::edit::META_KEY, &serde_json::to_string(&rules).map_err(err_str)?).map_err(err_str)?;
+    Ok(magpie_core::edit::view(rules))
+}
+
+/// Ctrl+E / ⌘E on a file: the app picked for its type, or the system's own
+/// edit action. The picked app runs only while it is still installed; one
+/// removed since (or from an imported settings file) falls back.
+#[tauri::command]
+async fn edit_file(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<String, String> {
+    require_indexed(&state, &path).await?;
+    let rules = {
+        let conn = state.db.lock().await;
+        let stored = db::meta_get(&conn, magpie_core::edit::META_KEY).map_err(err_str)?;
+        magpie_core::edit::parse_rules(stored.as_deref())
+    };
+    let p = Path::new(&path);
+    let picked = magpie_core::edit::app_for(&rules, p)
+        .filter(|t| state.apps.lock().unwrap().iter().any(|a| a.target == *t))
+        .map(str::to_string);
+    let l = match picked {
+        Some(t) => magpie_core::launch::editor_with(&t, p).map_err(err_str)?,
+        None => magpie_core::launch::default_edit(p),
+    };
+    run_launch(&app, l)
+}
+
+/// Move an indexed file to the trash (the palette asks twice first, and the
+/// check is repeated here so no caller can skip it); its row leaves the
+/// index at once.
+#[tauri::command]
+async fn trash_path(state: State<'_, AppState>, path: String, confirmed: bool) -> Result<String, String> {
+    if !confirmed {
+        return Err("confirm first".into());
+    }
+    require_indexed(&state, &path).await?;
+    if !Path::new(&path).exists() {
+        return Err("that file is no longer there".into());
+    }
+    if open_dry_run() {
+        return Ok(format!("dry run: trash {path}"));
+    }
+    let p = path.clone();
+    tokio::task::spawn_blocking(move || files::move_to_trash(&p))
+        .await
+        .map_err(err_str)?
+        .map_err(err_str)?;
+    let conn = state.db.lock().await;
+    let _ = files::forget_path(&conn, &path);
+    Ok(String::new())
+}
+/// `diff` alone: the last two texts copied, line by line (the older one is
+/// "before"). Needs the clipboard history, which keeps them.
+#[tauri::command]
+async fn clip_diff(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    if !state.clip_watch.load(Ordering::SeqCst) {
+        return Ok(json!({ "value": "Turn on clipboard history to compare the last two things you copied", "alt": "diff", "error": true }));
+    }
+    let texts = {
+        let conn = state.db.lock().await;
+        clips::latest_texts(&conn, 2).map_err(err_str)?
+    };
+    let [new, old] = texts.as_slice() else {
+        return Ok(json!({ "value": "Copy two pieces of text first; diff compares the last two", "alt": "diff", "error": true }));
+    };
+    let lines = magpie_core::handy::line_diff(old, new);
+    let added = lines.iter().filter(|(t, _)| *t == '+').count();
+    let removed = lines.iter().filter(|(t, _)| *t == '-').count();
+    if added + removed == 0 {
+        return Ok(json!({ "value": "The last two copies are the same", "alt": "diff", "error": true }));
+    }
+    let unified: String = lines.iter().map(|(t, l)| format!("{t}{l}")).collect::<Vec<_>>().join("\n");
+    Ok(json!({
+        "value": unified,
+        "alt": format!("diff · {removed} removed, {added} added"),
+        // drawn lines are masked like clip rows; Enter still copies the full diff
+        "diff": lines
+            .iter()
+            .map(|(t, l)| json!([t.to_string(), magpie_core::secrets::masked(l).unwrap_or_else(|| l.clone())]))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// `dl`: the newest files in the Downloads folder, shaped like file hits.
+/// Negative ids keep them apart from indexed files.
+#[tauri::command(async)]
+fn recent_downloads() -> Vec<serde_json::Value> {
+    let Some(dir) = files::downloads_dir() else { return Vec::new() };
+    files::newest_in(&dir, 20)
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| {
+            json!({
+                "kind": "file", "id": -(i as i64) - 1, "path": f.path, "name": f.name, "ext": f.ext,
+                "size": f.size, "mtime": f.mtime, "score": 0.0, "thumb": null, "snippet": null,
+            })
+        })
+        .collect()
+}
+
+/// Save an image from the clipboard history to a file, as stored (JPEG, up
+/// to 1600 px on the long edge).
+#[tauri::command]
+async fn save_clip_image(state: State<'_, AppState>, clip_id: i64, dest: String) -> Result<u64, String> {
+    let lower = dest.to_lowercase();
+    if !(lower.ends_with(".jpg") || lower.ends_with(".jpeg")) {
+        return Err("an image clip is saved as .jpg".into());
+    }
+    let jpeg = {
+        let conn = state.db.lock().await;
+        clips::image_clip_jpeg(&conn, clip_id).map_err(err_str)?
+    }
+    .ok_or("that clip is not an image")?;
+    std::fs::write(&dest, &jpeg).map_err(err_str)?;
+    Ok(jpeg.len() as u64)
+}
+
+/// A `timer 25m` countdown that has not fired yet.
+struct TimerEntry {
+    id: u64,
+    label: String,
+    /// unix milliseconds
+    ends_at: i64,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+/// Start a countdown; when it ends a system notification says `label`.
+/// `MAGPIE_NOTIFY_DRYRUN` (tests) skips the notification, the event still
+/// fires. The label is the user's own words and is never logged.
+#[tauri::command]
+fn start_timer(app: AppHandle, state: State<'_, AppState>, seconds: u64, label: String) -> Result<u64, String> {
+    if seconds == 0 || seconds > 86_400 {
+        return Err("a timer runs from one second to 24 hours".into());
+    }
+    let id = state.timer_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let ends_at = now_ms + seconds as i64 * 1000;
+    let (app2, label2) = (app.clone(), label.clone());
+    let task = tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+        app2.state::<AppState>().timers.lock().unwrap().retain(|t| t.id != id);
+        log::info!("timer {id} done");
+        let _ = app2.emit("timer-fired", json!({ "id": id, "label": label2 }));
+        if std::env::var_os("MAGPIE_NOTIFY_DRYRUN").is_none() {
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app2.notification().builder().title("magpie").body(&label2).show();
+        }
+    });
+    state.timers.lock().unwrap().push(TimerEntry { id, label, ends_at, task });
+    Ok(id)
+}
+
+/// Countdowns still running, soonest first.
+#[tauri::command]
+fn list_timers(state: State<'_, AppState>) -> Vec<serde_json::Value> {
+    let mut v: Vec<(i64, serde_json::Value)> = state
+        .timers
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| (t.ends_at, json!({ "id": t.id, "label": t.label, "ends_at": t.ends_at })))
+        .collect();
+    v.sort_by_key(|(e, _)| *e);
+    v.into_iter().map(|(_, j)| j).collect()
+}
+
+/// Stop a countdown before it fires. Returns whether one was stopped.
+#[tauri::command]
+fn cancel_timer(state: State<'_, AppState>, id: u64) -> bool {
+    let mut timers = state.timers.lock().unwrap();
+    match timers.iter().position(|t| t.id == id) {
+        Some(i) => {
+            timers.remove(i).task.abort();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Put a PNG (base64, e.g. a `qr` code) on the clipboard as an image.
+#[tauri::command]
+async fn copy_png(png_b64: String) -> Result<(), String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(png_b64.as_bytes()).map_err(err_str)?;
+    tokio::task::spawn_blocking(move || clips::set_clipboard_image(&bytes))
+        .await
+        .map_err(err_str)?
+        .map_err(err_str)
+}
+
+/// Pin/unpin a clipboard entry; pinned clips sort first and are exempt from
+/// count/age pruning. Returns the new state.
+#[tauri::command]
+async fn toggle_pin_clip(state: State<'_, AppState>, clip_id: i64) -> Result<bool, String> {
+    let conn = state.db.lock().await;
+    clips::toggle_pin(&conn, clip_id).map_err(err_str)
+}
+
+/// Put the FILE itself (not its path) on the clipboard, so pasting into a
+/// chat app or mail client attaches it. Uses the OS-native tooling per
+/// platform; Linux clipboards have no portable file flavor, so it degrades
+/// to the path as text.
+#[tauri::command]
+async fn copy_file_clip(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let allowed = {
+        let conn = state.db.lock().await;
+        files::path_is_allowed(&conn, &path).map_err(err_str)?
+    };
+    if !allowed {
+        return Err("path is outside indexed folders".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let escaped = path.replace('\'', "''");
+        let status = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("Set-Clipboard -LiteralPath '{escaped}'"),
+            ])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .status()
+            .map_err(err_str)?;
+        if !status.success() {
+            return Err("Set-Clipboard failed".into());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        let status = std::process::Command::new("osascript")
+            .args(["-e", &format!("set the clipboard to POSIX file \"{escaped}\"")])
+            .status()
+            .map_err(err_str)?;
+        if !status.success() {
+            return Err("osascript clipboard failed".into());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        copy_clip(path) // best effort: the path as text
+    }
+}
+
+/// The Accessibility page of System Settings, where the selection search's
+/// copy chord gets its permission (#17).
+const ACCESSIBILITY_SETTINGS: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+/// Open that page, from the hint the palette shows when the permission is
+/// missing. The hint replaces macOS's own prompt, which opened underneath
+/// the palette: the palette floats above every other window.
+#[tauri::command]
+fn open_accessibility_settings(app: AppHandle) -> Result<(), String> {
+    if open_dry_run() {
+        log::info!("dry run: open {ACCESSIBILITY_SETTINGS}");
+        return Ok(());
+    }
+    open_web(&app, ACCESSIBILITY_SETTINGS, "the Accessibility settings")
+}
+
+/// Open the OS log directory in the file manager — one click to grab the
+/// log file for a bug report.
+#[tauri::command]
+fn open_log_dir(app: AppHandle) -> Result<(), String> {
+    let dir = app.path().app_log_dir().map_err(err_str)?;
+    std::fs::create_dir_all(&dir).map_err(err_str)?;
+    open_default(&dir, "the log folder")
+}
+
+/// Rebuild the tray menu in the stored UI language (after a pause, resume or
+/// the semantic switch changed which items it offers).
+fn refresh_tray(app: &AppHandle) {
+    let lang = db::open(&app.state::<AppState>().db_path)
+        .ok()
+        .and_then(|c| db::meta_get(&c, "ui_lang").ok().flatten())
+        .unwrap_or_else(|| "en".into());
+    let _ = refresh_tray_menu(app, &lang);
+}
+
+/// Retitle the tray menu with the stored language + current badge state.
+fn refresh_tray_menu(app: &AppHandle, lang: &str) -> tauri::Result<()> {
+    let version = app
+        .state::<AppState>()
+        .update_badge
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_default();
+    let menu = build_tray_menu(app, lang, &version)?;
+    if let Some(tray) = app.tray_by_id("main") {
+        tray.set_menu(Some(menu))?;
+    }
+    Ok(())
+}
+
+/// Frontend found a pending update (or cleared it): remember the version,
+/// re-badge the tray icon, and add/remove the update menu item.
+#[tauri::command]
+fn set_update_badge(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    version: Option<String>,
+) -> Result<(), String> {
+    let version = version.unwrap_or_default();
+    if let Ok(mut v) = state.update_badge.lock() {
+        if *v == version {
+            return Ok(()); // periodic re-checks re-report the same version
+        }
+        *v = version.clone();
+    }
+    if !version.is_empty() {
+        log::info!("update available: v{version}");
+    }
+    let lang = db::open(&state.db_path)
+        .ok()
+        .and_then(|c| db::meta_get(&c, "ui_lang").ok().flatten())
+        .unwrap_or_else(|| "en".into());
+    refresh_tray_menu(&app, &lang).map_err(err_str)?;
+    if let (Some(tray), Some(base)) = (app.tray_by_id("main"), app.default_window_icon()) {
+        let icon = if version.is_empty() {
+            base.clone()
+        } else {
+            let (w, h) = (base.width(), base.height());
+            let mut rgba = base.rgba().to_vec();
+            magpie_core::badge::overlay_badge(&mut rgba, w, h);
+            tauri::image::Image::new_owned(rgba, w, h)
+        };
+        tray.set_icon(Some(icon)).map_err(err_str)?;
+    }
+    Ok(())
+}
+
+/// Persist the resolved UI language ("en"/"zh") and retitle the tray menu.
+/// The frontend resolves "auto" against the OS locale before calling this.
+#[tauri::command]
+fn set_ui_lang(app: AppHandle, state: State<'_, AppState>, lang: String) -> Result<(), String> {
+    let lang = match lang.as_str() { "zh" => "zh", "ru" => "ru", _ => "en" };
+    let conn = db::open(&state.db_path).map_err(err_str)?;
+    let before = db::meta_get(&conn, "ui_lang").map_err(err_str)?;
+    db::meta_set(&conn, "ui_lang", lang).map_err(err_str)?;
+    refresh_tray_menu(&app, lang).map_err(err_str)?;
+    // apps show their name in the interface language (活动监视器 in
+    // Chinese); the frontend reports the language on every launch, so only
+    // an actual change rescans
+    if before.as_deref() != Some(lang) {
+        spawn_app_scan(app);
+    }
+    Ok(())
+}
+
+/// The palette's footprint with the preview pane open, in logical pixels.
+/// Mirrors WINDOW_WIDTH + PREVIEW_PANE_WIDTH in src/App.tsx; `show_window`
+/// centres this box so the pane can open with a pure rightward resize.
+const PREVIEW_TOTAL_WIDTH: f64 = 1092.0;
+
+// The original palette automatically resizes after every React render and
+// via ResizeObserver. A user drag must disable this on the backend as well:
+// frontend-only checks cannot cancel already enqueued Tauri IPC calls.
+static PALETTE_USER_SIZED: AtomicBool = AtomicBool::new(false);
+// Serialize the mode check and set_size. An auto-fit already through its
+// AtomicBool check must not race a later manual resize/reset command.
+static PALETTE_SIZE_LOCK: StdMutex<()> = StdMutex::new(());
+
+/// Prevent legacy auto-fit from undoing native window resizing. The frontend
+/// must await this command before starting its Tauri resize gesture.
+#[tauri::command]
+fn enable_palette_user_resize() -> Result<(), String> {
+    let _guard = PALETTE_SIZE_LOCK.lock().map_err(err_str)?;
+    PALETTE_USER_SIZED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Restore or reset the chosen window size without touching the search DB.
+#[tauri::command]
+fn set_palette_user_sized(
+    app: AppHandle, enabled: bool, width: Option<f64>, height: Option<f64>,
+) -> Result<(), String> {
+    let _guard = PALETTE_SIZE_LOCK.lock().map_err(err_str)?;
+    let w = app.get_webview_window("main").ok_or("Main window unavailable")?;
+    if !enabled {
+        PALETTE_USER_SIZED.store(false, Ordering::SeqCst);
+        return Ok(());
+    }
+    // Reject invalid dimensions before switching to manual mode.
+    if let (Some(width), Some(height)) = (width, height) {
+        if !width.is_finite() || !height.is_finite() || width < 720.0 || height < 320.0 {
+            return Err("Invalid saved window size".into());
+        }
+    }
+    PALETTE_USER_SIZED.store(true, Ordering::SeqCst);
+    if let (Some(width), Some(height)) = (width, height) {
+        w.set_size(tauri::LogicalSize::new(width.min(2600.0), height.min(1700.0)))
+            .map_err(err_str)?;
+    }
+    Ok(())
+}
+
+/// Where a palette should sit once it has been resized.
+///
+/// The left edge stays pinned: `show_window` already reserved room for the
+/// pane, so growing rightwards into it is the normal case and nothing should
+/// move. The clamp is the safety net for a display too small for the reserved
+/// box, or a palette dragged against an edge before opening the pane. Sizes
+/// are the REQUESTED ones, not re-read from the window: macOS applies
+/// `set_size` asynchronously, and geometry read straight after it is stale.
+fn placed_after_resize(
+    pos: (i32, i32),
+    after: (i32, i32),
+    monitor: Option<((i32, i32), (i32, i32))>,
+) -> (i32, i32) {
+    let (mut x, mut y) = pos;
+    if let Some(((mx, my), (mw, mh))) = monitor {
+        // a window larger than the monitor leaves no range to clamp into; pin
+        // it to the corner rather than panicking on an inverted range
+        let fit = |v: i32, lo: i32, span: i32, size: i32| {
+            let hi = lo + span - size;
+            if hi < lo {
+                lo
+            } else {
+                v.clamp(lo, hi)
+            }
+        };
+        x = fit(x, mx, mw, after.0);
+        y = fit(y, my, mh, after.1);
+    }
+    (x, y)
+}
+
+/// Resize the palette and keep it on screen. See [`placed_after_resize`].
+///
+/// `width` and `height` are CSS pixels as the page measured them; `dpr` is
+/// the page's devicePixelRatio. On Windows the window gets exactly
+/// `css × dpr` physical pixels, which is what the page needs even when the
+/// webview's pixel ratio and the window's scale factor disagree (a zoomed
+/// webview, a scale factor not yet updated after a display change); with
+/// `dpr` missing, and on other systems, the window's own scale factor is
+/// used as before.
+#[tauri::command]
+fn resize_palette(app: AppHandle, width: f64, height: f64, dpr: Option<f64>) -> Result<(), String> {
+    // Mode check and set_size are one critical section, not just an atomic
+    // flag read: this prevents a queued automatic resize after user drag.
+    let _guard = PALETTE_SIZE_LOCK.lock().map_err(err_str)?;
+    if PALETTE_USER_SIZED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let Some(w) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    let before = w.outer_size().map_err(err_str)?;
+    // React runs the effect behind this on every render, so most calls ask for
+    // the size the window already has. Typing would otherwise churn through a
+    // resize per keystroke.
+    // Windows only: elsewhere the page's ratio can differ from the scale the
+    // toolkit converts with (WebKitGTK under fractional Wayland scaling
+    // reports 1.5 where GTK scales by 2), and the window came out smaller
+    let ratio = match dpr {
+        Some(r) if cfg!(windows) && r.is_finite() && r > 0.0 => r,
+        _ => w.scale_factor().map_err(err_str)?,
+    };
+    let want = tauri::PhysicalSize::new((width * ratio).round() as u32, (height * ratio).round() as u32);
+    if before.width == want.width && before.height == want.height {
+        return Ok(());
+    }
+    let pos = w.outer_position().map_err(err_str)?;
+    w.set_size(want).map_err(err_str)?;
+    let monitor = w.current_monitor().ok().flatten().map(|m| {
+        let (mp, ms) = (m.position(), m.size());
+        ((mp.x, mp.y), (ms.width as i32, ms.height as i32))
+    });
+    let (x, y) = placed_after_resize(
+        (pos.x, pos.y),
+        (want.width as i32, want.height as i32),
+        monitor,
+    );
+    if (x, y) != (pos.x, pos.y) {
+        w.set_position(tauri::PhysicalPosition::new(x, y))
+            .map_err(err_str)?;
+    }
+    Ok(())
+}
+
+/// The page found the window shorter than the palette after a resize (#16):
+/// written to the log with the numbers needed to tell why. Sizes only.
+#[tauri::command]
+fn note_palette_misfit(app: AppHandle, panel: f64, viewport: f64, dpr: f64) {
+    let (scale, inner) = app
+        .get_webview_window("main")
+        .map(|w| (w.scale_factor().ok(), w.inner_size().ok()))
+        .unwrap_or((None, None));
+    log::warn!("palette taller than its window: panel {panel} css px, viewport {viewport}, dpr {dpr}, scale {scale:?}, inner {inner:?}");
+}
+
+#[cfg(test)]
+mod clip_mcp_tests {
+    use super::clip_for_mcp;
+    use magpie_core::{clips, db};
+
+    /// issue #6: a copied key reaches MCP clients starred, plain text as is
+    #[test]
+    fn mcp_gets_keys_masked_and_plain_clips_whole() {
+        let conn = db::open_in_memory().unwrap();
+        let key = format!("ghp_{}", "a1B2".repeat(9));
+        clips::record_clip(&conn, &format!("GITHUB_TOKEN={key}"), 1000, 0).unwrap();
+        clips::record_clip(&conn, "cargo build --release", 1001, 0).unwrap();
+        let out: Vec<serde_json::Value> =
+            clips::recent_clips(&conn, 10).unwrap().into_iter().map(clip_for_mcp).collect();
+        let text: Vec<&str> = out.iter().map(|v| v["content"].as_str().unwrap()).collect();
+        assert_eq!(text, ["cargo build --release", "GITHUB_TOKEN=ghp_a1****B2a1B2"]);
+        let wire = serde_json::to_string(&out).unwrap();
+        assert!(!wire.contains(&key), "the key is nowhere in what is sent");
+        assert!(out.iter().all(|v| v["kind"] == "clip" && v["masked"].is_null()));
+    }
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::{resolve_selection_hotkey, DEFAULT_SELECTION_HOTKEY};
+
+    #[test]
+    fn selection_chord_is_on_by_default_off_when_removed_custom_when_set() {
+        assert_eq!(resolve_selection_hotkey(None).as_deref(), Some(DEFAULT_SELECTION_HOTKEY));
+        assert_eq!(resolve_selection_hotkey(Some("")), None, "an explicit removal stays removed");
+        assert_eq!(resolve_selection_hotkey(Some("   ")), None);
+        assert_eq!(resolve_selection_hotkey(Some(" Ctrl+Alt+F9 ")).as_deref(), Some("Ctrl+Alt+F9"));
+    }
+
+    #[test]
+    fn the_default_never_collides_with_the_summon_chord() {
+        assert_ne!(DEFAULT_SELECTION_HOTKEY, super::DEFAULT_HOTKEY);
+    }
+}
+
+#[cfg(test)]
+mod handoff_log_tests {
+    use super::handoff_kind;
+    use std::path::Path;
+
+    /// The log names the kind of thing opened, never where it is (#20).
+    #[test]
+    fn the_log_gets_the_extension_at_most_never_the_path() {
+        let cases = [
+            (r"C:\Users\someone\Secret Plans\budget 2027.XLSX", false, ".xlsx file"),
+            ("/home/someone/notes/today.md", false, ".md file"),
+            ("/home/someone/private", true, "folder"),
+            ("/home/someone/no-extension", false, "file"),
+            ("/home/someone/odd.na me", false, "file"),
+            ("/home/someone/long.abcdefghij", false, "file"),
+            ("/home/someone/x.工作", false, "file"),
+            ("/home/someone/trailing.", false, "file"),
+        ];
+        for (p, dir, want) in cases {
+            let got = handoff_kind(Path::new(p), dir);
+            assert_eq!(got, want, "{p}");
+            assert!(!got.contains("someone"), "{got}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_cancel_tests {
+    use super::take_search_conn;
+    use magpie_core::db;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    const ENDLESS: &str =
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c";
+
+    /// The scenario from the report: an expensive stale query (the lone "v"
+    /// of a retyped "vscode") is holding the connection when the next search
+    /// arrives. The new search must cancel it and take over promptly instead
+    /// of queueing behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_search_cancels_the_running_one_and_takes_over() {
+        let db = Arc::new(AsyncMutex::new(db::open_in_memory().expect("db")));
+        let interrupt = Arc::new(db.try_lock().unwrap().get_interrupt_handle());
+        let gen = Arc::new(AtomicU64::new(0));
+
+        let (db2, int2, gen2) = (db.clone(), interrupt.clone(), gen.clone());
+        let stale = tokio::spawn(async move {
+            let conn = take_search_conn(&db2, &int2, &gen2)
+                .await
+                .expect("first ticket runs");
+            let r: Result<i64, _> = conn.query_row(ENDLESS, [], |row| row.get(0));
+            r.is_err() // the endless query can only end by being interrupted
+        });
+        // let the stale query actually start spinning on the connection
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let started = std::time::Instant::now();
+        let conn = take_search_conn(&db, &interrupt, &gen)
+            .await
+            .expect("the latest ticket wins");
+        let waited = started.elapsed();
+        let v: i64 = conn.query_row("SELECT 5", [], |row| row.get(0)).expect("query");
+        drop(conn);
+
+        assert_eq!(v, 5, "the new search must run normally after the takeover");
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "the new search waited {waited:?}; it must not queue behind the stale scan"
+        );
+        assert!(stale.await.unwrap(), "the stale query must have been interrupted");
+    }
+
+    /// A burst of a hundred keystrokes: no deadlock, no panic, every ticket
+    /// settles, and the newest one is the one that gets to run last.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_burst_of_searches_settles_with_the_newest_running_last() {
+        let db = Arc::new(AsyncMutex::new(db::open_in_memory().expect("db")));
+        let interrupt = Arc::new(db.try_lock().unwrap().get_interrupt_handle());
+        let gen = Arc::new(AtomicU64::new(0));
+        let ran = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        for i in 0..100u64 {
+            let (db, int, gen, ran) = (db.clone(), interrupt.clone(), gen.clone(), ran.clone());
+            tasks.push(tokio::spawn(async move {
+                if let Some(conn) = take_search_conn(&db, &int, &gen).await {
+                    // a short real query, so interrupts have something to hit
+                    let _: Result<i64, _> = conn.query_row("SELECT 1", [], |r| r.get(0));
+                    ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Some(i);
+                }
+                None
+            }));
+        }
+        let mut winners = Vec::new();
+        for t in tasks {
+            if let Some(i) = tokio::time::timeout(std::time::Duration::from_secs(10), t)
+                .await
+                .expect("no deadlock")
+                .expect("no panic")
+            {
+                winners.push(i);
+            }
+        }
+        assert_eq!(gen.load(std::sync::atomic::Ordering::SeqCst), 100, "every ticket was issued");
+        assert!(!winners.is_empty(), "at least one search ran");
+        assert_eq!(winners.len() as u64, ran.load(std::sync::atomic::Ordering::SeqCst));
+        // the connection is still healthy afterwards
+        let v: i64 = db.lock().await.query_row("SELECT 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 2);
+    }
+
+    /// Three keystrokes race for the lock: whoever is no longer the newest by
+    /// the time it reaches the head of the queue must bail without running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_superseded_ticket_does_no_work() {
+        let db = Arc::new(AsyncMutex::new(db::open_in_memory().expect("db")));
+        let interrupt = Arc::new(db.try_lock().unwrap().get_interrupt_handle());
+        let gen = Arc::new(AtomicU64::new(0));
+
+        // hold the connection so both tickets have to queue
+        let guard = db.lock().await;
+        let (db2, int2, gen2) = (db.clone(), interrupt.clone(), gen.clone());
+        let older = tokio::spawn(async move {
+            take_search_conn(&db2, &int2, &gen2).await.is_none()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (db3, int3, gen3) = (db.clone(), interrupt.clone(), gen.clone());
+        let newer = tokio::spawn(async move {
+            take_search_conn(&db3, &int3, &gen3).await.is_some()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(guard); // tokio's mutex is fair: the older ticket wakes first
+
+        assert!(older.await.unwrap(), "the overtaken ticket must bail");
+        assert!(newer.await.unwrap(), "the newest ticket must get the connection");
+    }
+
+    /// The mechanism take_search_conn leans on: an interrupt raised from
+    /// another thread stops a running statement with an error, and the
+    /// connection stays usable for the next query.
+    #[test]
+    fn interrupt_stops_a_running_query_and_the_connection_survives() {
+        let conn = db::open_in_memory().expect("in-memory db");
+        let handle = conn.get_interrupt_handle();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            handle.interrupt();
+        });
+        // unbounded recursive CTE: runs until something stops it
+        let started = std::time::Instant::now();
+        let r: Result<i64, _> = conn.query_row(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c",
+            [],
+            |row| row.get(0),
+        );
+        t.join().unwrap();
+        assert!(r.is_err(), "the interrupt must surface as an error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the query must stop near the interrupt, not run on"
+        );
+        let ok: i64 = conn
+            .query_row("SELECT 41 + 1", [], |row| row.get(0))
+            .expect("the connection must survive an interrupt");
+        assert_eq!(ok, 42);
+    }
+
+    /// Raising the flag while nothing runs must not poison later queries:
+    /// take_search_conn interrupts before it knows whether a search is
+    /// actually in flight.
+    #[test]
+    fn interrupt_with_nothing_running_is_harmless() {
+        let conn = db::open_in_memory().expect("in-memory db");
+        conn.get_interrupt_handle().interrupt();
+        let ok: i64 = conn
+            .query_row("SELECT 7", [], |row| row.get(0))
+            .expect("a statement started after the flag must run normally");
+        assert_eq!(ok, 7);
+    }
+}
+
+#[cfg(test)]
+mod web_rank_tests {
+    use super::*;
+
+    /// issue #5: with three unrelated bookmarks every query used to list all
+    /// three. Meaning-only hits now show only when nothing shares a word
+    /// with the query, at most WEB_FUZZY_MAX of them.
+    #[test]
+    fn web_shows_meaning_only_hits_only_without_keyword_hits() {
+        let conn = db::open_in_memory().expect("in-memory db");
+        let mut values = Vec::new();
+        for i in 1..=5 {
+            values.push(format!("({i}, 'https://site{i}.example/', 'Page number {i}', '', 'chrome', 1)"));
+        }
+        values.push("(6, 'https://www.bilibili.com/', 'bilibili', '', 'chrome', 1)".into());
+        conn.execute_batch(&format!(
+            "INSERT INTO bookmarks (id, url, title, folder, browser, added_at) VALUES {};",
+            values.join(",")
+        ))
+        .unwrap();
+        let mut store = VectorStore::empty();
+        store.bookmarks = (1..=6).map(|id| (id, vec![1.0, 0.0])).collect();
+        let q = [1.0f32, 0.0];
+        let urls = |hits: &[serde_json::Value]| -> Vec<String> {
+            hits.iter().map(|h| h["url"].as_str().unwrap().to_string()).collect()
+        };
+
+        // a keyword hit exists: it is the whole list
+        let hits = rank_web(&conn, &store, "bili", Some(&q), "all", 40).unwrap();
+        assert_eq!(urls(&hits), vec!["https://www.bilibili.com/"]);
+        assert_eq!(hits[0]["fuzzy"], false);
+        assert_eq!(hits[0]["browsers"], json!(["chrome"]));
+
+        // nothing shares a word: a few meaning-only hits, marked
+        let hits = rank_web(&conn, &store, "zzqx", Some(&q), "all", 40).unwrap();
+        assert_eq!(hits.len(), WEB_FUZZY_MAX);
+        assert!(hits.iter().all(|h| h["fuzzy"] == true));
+
+        // and without the model, nothing at all
+        assert!(rank_web(&conn, &store, "zzqx", None, "all", 40).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::{reload_loaded, StdMutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The order of stop/spawn calls, the reinit flag afterwards, and "a
+    /// reload is on its way" as reported to the caller.
+    fn run(initing: bool, reinit: bool, status: &str) -> (Vec<&'static str>, bool, bool) {
+        let initing = AtomicBool::new(initing);
+        let reinit = AtomicBool::new(reinit);
+        let status = StdMutex::new(status.to_string());
+        let calls = StdMutex::new(Vec::new());
+        let reported = reload_loaded(
+            &initing,
+            &reinit,
+            &status,
+            || calls.lock().unwrap().push("stop"),
+            || calls.lock().unwrap().push("spawn"),
+        );
+        let calls = calls.into_inner().unwrap();
+        (calls, reinit.load(Ordering::SeqCst), reported)
+    }
+
+    #[test]
+    fn a_ready_model_is_stopped_then_reloaded_once() {
+        // stop before spawn: the load that follows is what lifts the stop
+        assert_eq!(run(false, false, "ready"), (vec!["stop", "spawn"], false, true));
+    }
+
+    #[test]
+    fn a_model_that_is_off_or_failed_is_left_alone() {
+        // nothing spawned and, above all, nothing stopped: with no load in
+        // flight there would be nobody to lift the stop
+        assert_eq!(run(false, false, ""), (vec![], false, false));
+        assert_eq!(run(false, false, "failed: no network"), (vec![], false, false));
+    }
+
+    #[test]
+    fn a_load_in_flight_gets_one_rerun_queued_instead() {
+        assert_eq!(run(true, false, "loading"), (vec!["stop"], true, true));
+        // queueing twice is still one rerun
+        assert_eq!(run(true, true, "downloading model.onnx 40%"), (vec!["stop"], true, true));
+    }
+
+    #[test]
+    fn every_stop_has_a_load_in_flight_to_lift_it() {
+        // the invariant behind the ordering: on any path that stops, either
+        // a load was already running (queued) or one is spawned right after
+        for (initing, status) in [(false, "ready"), (true, "loading"), (true, "ready")] {
+            let (calls, _, _) = run(initing, false, status);
+            if calls.contains(&"stop") {
+                assert!(initing || calls.contains(&"spawn"), "{initing} {status}: {calls:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::{placed_after_resize, PREVIEW_TOTAL_WIDTH};
+
+    const HD: Option<((i32, i32), (i32, i32))> = Some(((0, 0), (1366, 768)));
+
+    #[test]
+    fn growing_into_the_reserved_box_never_moves_the_window() {
+        // show_window seats a 720-wide palette at the left edge of the centred
+        // 1092 box: x = (2560 - 1092) / 2 = 734. Opening the pane grows into
+        // room that is already reserved, so the position must not change.
+        let wide = Some(((0, 0), (2560, 1440)));
+        assert_eq!(
+            placed_after_resize((734, 456), (1092, 480), wide),
+            (734, 456)
+        );
+        // and the whole box sits centred: 734 + 1092 = 1826, 2560 - 1826 = 734
+        assert_eq!(2560 - (734 + 1092), 734);
+    }
+
+    #[test]
+    fn the_reserved_box_fits_a_1366_screen() {
+        // x = (1366 - 1092) / 2 = 137, and 137 + 1092 = 1229 <= 1366, so
+        // opening the pane must stay put
+        assert_eq!(placed_after_resize((137, 200), (1092, 480), HD), (137, 200));
+    }
+
+    #[test]
+    fn a_palette_dragged_against_the_right_edge_is_pulled_back() {
+        let (x, _) = placed_after_resize((640, 200), (1092, 480), HD);
+        assert_eq!(x, 274, "clamped so the right edge lands exactly on 1366");
+        assert_eq!(x + 1092, 1366);
+    }
+
+    #[test]
+    fn height_only_changes_leave_the_window_alone() {
+        // 100 + 620 = 720, inside the 768-tall screen, so nothing should move
+        assert_eq!(placed_after_resize((323, 100), (720, 620), HD), (323, 100));
+    }
+
+    #[test]
+    fn a_tall_palette_is_pulled_up_onto_the_screen() {
+        let (_, y) = placed_after_resize((323, 600), (720, 620), HD);
+        assert_eq!(y, 148);
+        assert_eq!(y + 620, 768);
+    }
+
+    #[test]
+    fn a_window_larger_than_the_monitor_pins_to_the_corner() {
+        assert_eq!(placed_after_resize((100, 100), (2000, 900), HD), (0, 0));
+    }
+
+    #[test]
+    fn a_second_monitor_clamps_to_its_own_offset() {
+        // a 1366-wide display sitting to the right of a 2560-wide primary
+        let right = Some(((2560, 0), (1366, 768)));
+        let (x, y) = placed_after_resize((2883, 200), (1092, 480), right);
+        assert_eq!((x, y), (2834, 200));
+        assert!(x >= 2560 && x + 1092 <= 2560 + 1366);
+    }
+
+    #[test]
+    fn no_monitor_information_leaves_the_window_alone() {
+        assert_eq!(placed_after_resize((323, 200), (1092, 480), None), (323, 200));
+    }
+
+    #[test]
+    fn shrinking_back_keeps_the_left_edge() {
+        // close the pane: the palette stays where its left edge always was
+        let wide = Some(((0, 0), (2560, 1440)));
+        assert_eq!(placed_after_resize((734, 456), (720, 480), wide), (734, 456));
+    }
+
+    #[test]
+    fn the_reserved_width_matches_the_frontend_constants() {
+        // WINDOW_WIDTH (720) + PREVIEW_PANE_WIDTH (372) in src/App.tsx; the
+        // static sweep checks the TS side, this pins the Rust side to it
+        assert_eq!(PREVIEW_TOTAL_WIDTH, 1092.0);
+    }
+}
+
+/// Restart after installing an update.
+///
+/// The single-instance lock has to be released first. `restart()` spawns the
+/// replacement process and only then exits this one, so a lock still held here
+/// makes the replacement see a running instance and quit on startup, leaving
+/// the user with nothing after an update. Windows never reaches this path (the
+/// updater runs the NSIS installer and exits through `process::exit`), but
+/// macOS and Linux do.
+#[tauri::command]
+fn restart_for_update(app: AppHandle) {
+    log::info!("update installed; releasing the single-instance lock and restarting");
+    tauri_plugin_single_instance::destroy(&app);
+    app.restart();
+}
+
+/// Every page, file, folder or app magpie hands to another program goes
+/// through these, and each leaves one line in the log saying why, and for a
+/// file its extension; never the address, the path or the app's name. A
+/// browser that seems to open by itself (#20) can then be told apart from one
+/// magpie opened.
+fn open_web(app: &AppHandle, url: &str, why: &str) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let r = app.opener().open_url(url, None::<&str>).map_err(err_str);
+    log_handoff("web page", why, &r);
+    r
+}
+
+/// A file or folder in the program the OS picks for it.
+fn open_default(path: &Path, why: &str) -> Result<(), String> {
+    let r = tauri_plugin_opener::open_path(path, None::<&str>).map_err(err_str);
+    log_handoff(&handoff_kind(path, path.is_dir()), why, &r);
+    r
+}
+
+/// What the log calls a file or folder: its extension at most. An extension
+/// is a kind of file, short and plain; anything else is left out rather than
+/// written down.
+fn handoff_kind(path: &Path, is_dir: bool) -> String {
+    if is_dir {
+        return "folder".to_string();
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(e) if !e.is_empty() && e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            format!(".{} file", e.to_ascii_lowercase())
+        }
+        _ => "file".to_string(),
+    }
+}
+
+/// An installed app from the app list.
+fn start_app(target: &str, why: &str) -> Result<(), String> {
+    let r = magpie_core::apps::launch_app(target).map_err(err_str);
+    log_handoff("app", why, &r);
+    r
+}
+
+fn log_handoff(what: &str, why: &str, r: &Result<(), String>) {
+    match r {
+        Ok(()) => log::info!("opened a {what} ({why})"),
+        // the error text can carry the path or the address: not logged
+        Err(_) => log::warn!("could not open a {what} ({why})"),
+    }
+}
+
+/// Hide the palette window. Every hide goes through here so the page hears
+/// of it ("palette-hidden") and can drop what should not outlive a summon,
+/// such as the preview pane (#13), while the window is out of sight.
+fn hide_palette(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+    let _ = app.emit("palette-hidden", ());
+}
+
+/// Put the palette away and give the focus back (#9). On macOS hiding only
+/// the window left magpie the active app, so the window underneath showed as
+/// inactive until clicked; hiding the app hands activation back to the app
+/// that had it. For dismissals only: after launching or revealing something,
+/// that app takes the focus itself and the window alone is hidden.
+fn dismiss_palette(app: &AppHandle) {
+    hide_palette(app);
+    #[cfg(target_os = "macos")]
+    let _ = app.hide();
+}
+
+/// Esc and the like from the page: see [`dismiss_palette`].
+#[tauri::command]
+fn dismiss(app: AppHandle) {
+    dismiss_palette(&app);
+}
+
+/// The summon key and `--toggle`. Each press leaves a line in the log (#20: a
+/// press that brought up a browser instead could not be told apart from one
+/// magpie never received).
+fn toggle_window(app: &AppHandle, from: &str) {
+    let Some(w) = app.get_webview_window("main") else {
+        log::warn!("{from}: no palette window");
+        return;
+    };
+    let shown = match w.is_visible() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("{from}: could not tell whether the palette is shown ({e}); showing it");
+            false
+        }
+    };
+    if shown {
+        log::info!("{from}: palette was shown, hiding it");
+        dismiss_palette(app);
+    } else {
+        log::info!("{from}: palette was hidden, showing it");
+        show_window(app);
+    }
+}
+
+/// Let the palette appear over another app's full-screen Space.
+///
+/// `set_visible_on_all_workspaces` only sets `CanJoinAllSpaces`. A full-screen
+/// app lives in its own Space, and AppKit keeps every window out of it unless
+/// the window also carries `FullScreenAuxiliary`; without that flag the hotkey
+/// appears to do nothing while, say, a browser or video is full screen. Both
+/// flags are OR-ed in so tao's own bookkeeping of the first one is preserved.
+#[cfg(target_os = "macos")]
+fn allow_over_fullscreen(w: &tauri::WebviewWindow) {
+    use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+    let w = w.clone();
+    let _ = w.clone().run_on_main_thread(move || {
+        let Ok(ptr) = w.ns_window() else { return };
+        // SAFETY: the pointer is the live NSWindow tao owns for this webview
+        // window, and NSWindow is main-thread-only, which this closure is
+        let ns: &NSWindow = unsafe { &*(ptr as *const NSWindow) };
+        let behavior = ns.collectionBehavior()
+            | NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary;
+        ns.setCollectionBehavior(behavior);
+    });
+}
+
+fn show_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        // launcher position: horizontally centered, upper fifth (Spotlight
+        // convention) — on the monitor the CURSOR is on, so multi-display
+        // users summon the palette where they're looking. Monitor offsets
+        // are global coordinates; the old math ignored them and always
+        // landed on the primary display.
+        let monitor = app
+            .cursor_position()
+            .ok()
+            .and_then(|cur| {
+                w.available_monitors().ok().and_then(|mons| {
+                    mons.into_iter().find(|m| {
+                        let p = m.position();
+                        let s = m.size();
+                        cur.x >= p.x as f64
+                            && cur.x < (p.x + s.width as i32) as f64
+                            && cur.y >= p.y as f64
+                            && cur.y < (p.y + s.height as i32) as f64
+                    })
+                })
+            })
+            .or_else(|| w.current_monitor().ok().flatten());
+        if let (Some(monitor), Ok(size)) = (monitor, w.outer_size()) {
+            let mp = monitor.position();
+            let ms = monitor.size();
+            // Centre the box the palette can GROW into, not the palette
+            // itself. The preview pane extends the window to the right, and
+            // moving the window at that moment does not work everywhere
+            // (macOS applies set_size asynchronously, so a reposition
+            // computed right after it reads stale geometry). Reserving the
+            // expanded footprint up front means opening and closing the pane
+            // is a pure resize with the left edge pinned: nothing has to
+            // move, on any platform. The palette sits slightly left of
+            // centre as a result; the pane opens into the reserved half.
+            let reserved = (PREVIEW_TOTAL_WIDTH * monitor.scale_factor()) as i32;
+            let span = reserved.max(size.width as i32);
+            let x = mp.x + ((ms.width as i32 - span) / 2).max(0);
+            let y = mp.y + (ms.height as f64 * 0.22) as i32;
+            let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+        }
+        // above everything, on every summon: re-assert topmost (another app
+        // may have claimed it) and follow the user across macOS Spaces
+        let _ = w.set_always_on_top(false); // ordinary macOS window, not a floating overlay
+        let _ = w.set_visible_on_all_workspaces(true);
+        #[cfg(target_os = "macos")]
+        allow_over_fullscreen(&w);
+        // a dismissal hid the whole app on macOS (#9): bring it back first
+        #[cfg(target_os = "macos")]
+        let _ = app.show();
+        if let Err(e) = w.show() {
+            log::warn!("could not show the palette: {e}");
+        }
+        if let Err(e) = w.set_focus() {
+            log::warn!("could not focus the palette: {e}");
+        }
+        let _ = app.emit("palette-shown", ());
+        rescan_apps_if_stale(app);
+    }
+}
+
+/// A command-line request from a launch, for the log: which flags, never the
+/// query text.
+fn describe_request(req: &cli::Request) -> String {
+    if req.is_empty() {
+        return "no arguments".into();
+    }
+    let mut parts = Vec::new();
+    if req.toggle {
+        parts.push("--toggle".to_string());
+    }
+    if let Some(s) = &req.source {
+        parts.push(format!("--source {s}"));
+    }
+    if req.query.is_some() {
+        parts.push("--query".into());
+    }
+    parts.join(" ")
+}
+
+/// The request magpie was started with, kept until the page has loaded and
+/// asks for it (an event sent during setup would reach no one).
+static FIRST_LAUNCH: StdMutex<Option<cli::Request>> = StdMutex::new(None);
+
+/// Act on a launch's arguments in the running copy: `--toggle` alone hides
+/// a showing palette; a tab or a query shows it and the page applies them;
+/// a plain launch shows it, as it always did.
+fn handle_request(app: &AppHandle, req: cli::Request) {
+    if req.toggle && !req.opens_something() {
+        toggle_window(app, "--toggle");
+        return;
+    }
+    if req.opens_something() {
+        let _ = app.emit("open-request", &req);
+    }
+    show_window(app);
+}
+
+/// The page, once loaded, collects the request of the launch that started
+/// magpie (see [`FIRST_LAUNCH`]).
+#[tauri::command]
+fn take_launch_request() -> Option<cli::Request> {
+    FIRST_LAUNCH.lock().ok()?.take()
+}
+
+pub fn run() {
+    // The AppImage keeps running on X11 (XWayland under Wayland), as it did
+    // when the bundler forced it; tauri-cli 2.12 stopped forcing it while
+    // fixing #15 (the bundled libwayland-client is gone). A choice the user
+    // makes with GDK_BACKEND still wins. Set before GTK starts, while only
+    // this thread runs.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("APPIMAGE").is_some() && std::env::var_os("GDK_BACKEND").is_none() {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
+    // `mut` is only exercised by the macOS activation-policy call below
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut app = tauri::Builder::default()
+        // Registered before everything else so a second launch exits before it
+        // opens the database or claims a tray icon. magpie lives in the tray
+        // and answers to a hotkey, so clicking the icon again means "show me
+        // the palette", never "start another copy".
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            let req = cli::parse(cli::after_program(argv));
+            log::info!("second launch requested ({}); summoning the running instance", describe_request(&req));
+            handle_request(app, req);
+        }))
+        // logging first, so every later plugin/setup line can log. Info level,
+        // one rotated file in the OS log dir — enough forensics for bug
+        // reports, small enough to attach to an issue. Queries are never
+        // logged (privacy).
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .max_file_size(2_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("magpie".into()),
+                    }),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                ])
+                .build(),
+        )
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // launch at login: a LaunchAgent on macOS, the HKCU Run key on
+        // Windows, an XDG autostart entry on Linux. Off until the user
+        // switches it on in settings.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .setup(|app| {
+            log::info!("magpie v{} starting", app.package_info().version);
+            // macOS activation policy is set in `run`, before the event loop
+            // starts; doing it here is too late for the palette window.
+            let data_dir = app.path().app_data_dir()?;
+            let db_path = data_dir.join("stars.db");
+            let model_dir = data_dir.join("models");
+            let conn = db::open(&db_path)?;
+            db::meta_set(&conn, "term_notify", "0")?; // disable China-calendar alerts
+            // Isolated test edition: no automatic scanning of the user's
+            // other sources, no 30-minute reconciliation until explicitly enabled.
+            if WORK_SAFE || option_env!("LOCALSEARCH_PARALLEL_TEST").is_some() {
+                db::meta_set(&conn, "rescan_minutes", "0")?;
+            }
+            sync::ensure_embed_model(&conn)?;
+            // must be set before model init spawns: hf-hub reads HF_ENDPOINT
+            if let Ok(Some(ep)) = db::meta_get(&conn, "hf_endpoint") {
+                if !ep.is_empty() {
+                    std::env::set_var("HF_ENDPOINT", ep);
+                }
+            }
+            let clipboard_enabled = db::meta_get(&conn, "clipboard_enabled")
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("1");
+            // clip housekeeping on every launch: retention window + count cap
+            {
+                let days = db::meta_get(&conn, "clip_retention_days")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(30u32);
+                let _ = clips::prune_clips(&conn, days, unix_now());
+                let cap = db::meta_get(&conn, "clip_max_entries")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0u32);
+                let _ = clips::prune_clips_to_count(&conn, cap);
+            }
+            let store = VectorStore::load(&conn).unwrap_or_else(|_| VectorStore::empty());
+
+            // opened after `conn` so migrations have already run once; this
+            // twin only ever reads (interactive searches), so a cancelled
+            // search can never take a write down with it
+            let search_conn = db::open(&db_path)?;
+            let search_interrupt = search_conn.get_interrupt_handle();
+
+            app.manage(AppState {
+                db_path,
+                model_dir,
+                db: AsyncMutex::new(conn),
+                search_db: AsyncMutex::new(search_conn),
+                search_interrupt,
+                search_gen: AtomicU64::new(0),
+                store: Arc::new(StdMutex::new(store)),
+                embedder: Arc::new(StdMutex::new(None)),
+                model_status: Arc::new(StdMutex::new("loading".into())),
+                siglip: Arc::new(StdMutex::new(None)),
+                siglip_status: Arc::new(StdMutex::new("loading".into())),
+                sync_running: Arc::new(AtomicBool::new(false)),
+                local_indexing: Arc::new(AtomicBool::new(false)),
+                file_embedding_passes: Arc::new(AtomicUsize::new(0)),
+                sleep_hold_active: Arc::new(AtomicBool::new(false)),
+                video_indexing: Arc::new(AtomicBool::new(false)),
+                video_note: Arc::new(StdMutex::new(String::new())),
+                ffmpeg_status: Arc::new(StdMutex::new(String::new())),
+                model_initing: Arc::new(AtomicBool::new(false)),
+                model_reinit: Arc::new(AtomicBool::new(false)),
+                siglip_initing: Arc::new(AtomicBool::new(false)),
+                siglip_reinit: Arc::new(AtomicBool::new(false)),
+                models_paused: Arc::new(AtomicBool::new(false)),
+                apps: Arc::new(StdMutex::new(Vec::new())),
+                app_icons: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+                icon_stamps: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+                timers: Arc::new(StdMutex::new(Vec::new())),
+                timer_seq: Arc::new(AtomicU64::new(0)),
+                update_badge: Arc::new(StdMutex::new(String::new())),
+                ocr: Arc::new(StdMutex::new(None)),
+                ocr_status: Arc::new(StdMutex::new(String::new())),
+                ocr_initing: Arc::new(AtomicBool::new(false)),
+                ocr_reinit: Arc::new(AtomicBool::new(false)),
+                ocr_indexing: Arc::new(AtomicBool::new(false)),
+                clip_watch: Arc::new(AtomicBool::new(clipboard_enabled)),
+                clip_thread_alive: Arc::new(AtomicBool::new(false)),
+                mcp: Arc::new(StdMutex::new(None)),
+                mcp_status: Arc::new(StdMutex::new(String::new())),
+                watcher: Arc::new(StdMutex::new(None)),
+                pending: Arc::new(StdMutex::new(watch::Pending::default())),
+                watch_status: Arc::new(StdMutex::new(String::new())),
+                watched_folders: Arc::new(AtomicUsize::new(0)),
+            });
+            if clipboard_enabled && !WORK_SAFE {
+                spawn_clip_watcher(app.handle().clone());
+            }
+            if !WORK_SAFE {
+                spawn_app_scan(app.handle().clone());
+                #[cfg(target_os = "macos")]
+                spawn_sleep_index_guard(app.handle().clone());
+                spawn_ffmpeg_check(app.handle().clone());
+            }
+            // China-specific solar term notifications disabled in the local-search edition.
+            // Windows 11 rounds the palette window itself (#16); Windows 10
+            // cannot, and the panel then drops its CSS radius to match
+            #[cfg(windows)]
+            if let Some(w) = app.get_webview_window("main") {
+                if let Ok(h) = w.hwnd() {
+                    let round = magpie_core::corners::round(h.0 as isize);
+                    let _ = WINDOW_CORNERS.set(if round { "round" } else { "square" });
+                    log::info!("window corners: {}", if round { "rounded by the system" } else { "square" });
+                }
+            }
+            // the MCP server for AI assistants, only if the user switched it on
+            {
+                let state = app.state::<AppState>();
+                let on = db::open(&state.db_path)
+                    .ok()
+                    .and_then(|c| db::meta_get(&c, "mcp_enabled").ok().flatten())
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if on && !WORK_SAFE {
+                    *state.mcp_status.lock().unwrap() = "starting".into();
+                    start_mcp(app.handle().clone());
+                }
+            }
+
+            // file changes: a watcher on every indexed folder (unless switched
+            // off) and the ticker that turns its events into scoped re-indexes
+            if !WORK_SAFE || option_env!("LOCALSEARCH_PARALLEL_TEST").is_some() {
+                rewatch(app.handle());
+                spawn_watch_ticker(app.handle().clone());
+            }
+            if !WORK_SAFE {
+                spawn_failed_embed_retries(app.handle().clone());
+            }
+
+            // tray: Show / Sync / Settings / Quit (labels follow the UI language)
+            let ui_lang = {
+                let state = app.state::<AppState>();
+                db::open(&state.db_path)
+                    .ok()
+                    .and_then(|c| db::meta_get(&c, "ui_lang").ok().flatten())
+                    .unwrap_or_else(|| "en".into())
+            };
+            let menu = build_tray_menu(app.handle(), &ui_lang, "")?;
+            #[allow(unused_mut)]
+            let mut tray = TrayIconBuilder::with_id("main")
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("LocalSearch WORK FTS — отдельная тестовая копия")
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => show_window(app),
+                    "sync" => spawn_sync(app.clone()),
+                    "settings" | "update" => {
+                        show_window(app);
+                        let _ = app.emit("open-settings", ());
+                    }
+                    "quit" => app.exit(0),
+                    // off the main thread: a pause waits for a pass to let go
+                    "pause" | "resume" => {
+                        let (app, pause) = (app.clone(), event.id.as_ref() == "pause");
+                        std::thread::spawn(move || pause_models_now(&app, pause));
+                    }
+                    _ => {}
+                });
+            // Linux writes the tray image to disk: $XDG_RUNTIME_DIR/tray-icon,
+            // or without it a /tmp/tray-icon shared by every user, where the
+            // second user to start magpie got "Permission denied" and the app
+            // died in setup. The app's own cache folder is per user.
+            #[cfg(target_os = "linux")]
+            if let Ok(dir) = app.path().app_cache_dir() {
+                tray = tray.temp_dir_path(dir.join("tray-icon"));
+            }
+            // no tray (a desktop without one, or one that refuses) leaves the
+            // hotkey working; it must not stop the app from starting
+            if let Err(e) = tray.build(app) {
+                log::warn!("tray icon unavailable: {e}");
+            } else {
+                spawn_tray_index_status(app.handle().clone());
+            }
+
+            // register the stored (or default) summon hotkey. Registration can
+            // fail when another launcher owns the chord — degrade to tray-only
+            // instead of crashing the app.
+            let (hotkey, selection) = {
+                let state = app.state::<AppState>();
+                let db_path = state.db_path.clone();
+                let conn = db::open(&db_path).ok();
+                let get = |k: &str| conn.as_ref().and_then(|c| db::meta_get(c, k).ok().flatten());
+                (
+                    get("hotkey").unwrap_or_else(|| DEFAULT_HOTKEY.to_string()),
+                    resolve_selection_hotkey(get("hotkey_selection").as_deref()),
+                )
+            };
+            if !WORK_SAFE {
+                if let Err(e) = register_hotkeys(app.handle(), &hotkey, selection.as_deref()) {
+                    log::warn!("global shortcut {hotkey} unavailable: {e}");
+                    if selection.is_some() {
+                        let _ = register_hotkeys(app.handle(), &hotkey, None);
+                    }
+                }
+            }
+            // on a Wayland desktop the key is the desktop's to bind (#15):
+            // through its own IPC where it has one; it runs tools, so not
+            // on this thread
+            #[cfg(target_os = "linux")]
+            {
+                let key = hotkey.clone();
+                std::thread::spawn(move || wayland_hotkey::apply(&key));
+            }
+            // started with arguments: show the palette; the page collects a
+            // tab or a query once it has loaded (take_launch_request)
+            let first = cli::parse(std::env::args().skip(1));
+            if !first.is_empty() {
+                log::info!("started with {}", describe_request(&first));
+                if first.opens_something() {
+                    if let Ok(mut slot) = FIRST_LAUNCH.lock() {
+                        *slot = Some(first);
+                    }
+                }
+                show_window(app.handle());
+            }
+
+            spawn_model_init(app.handle().clone());
+            // The preview is a regular app: show its window on every launch.
+            #[cfg(target_os = "macos")]
+            show_window(app.handle());
+            // a fresh install: open on the welcome screen, which asks about
+            // semantic search before anything is downloaded (#8)
+            if semantic_choice(&app.state::<AppState>()) == magpie_core::semantic::Choice::Undecided {
+                log::info!("first start: showing the welcome screen");
+                show_window(app.handle());
+            }
+            // the image model only when something already needs it; an index
+            // pass or a copied image loads it later if that changes
+            {
+                let state = app.state::<AppState>();
+                let needed = db::open(&state.db_path)
+                    .ok()
+                    .and_then(|c| files::needs_image_model(&c).ok())
+                    .unwrap_or(true); // unsure: keep the old behaviour
+                if needed {
+                    spawn_siglip_init(app.handle().clone());
+                } else {
+                    *state.siglip_status.lock().unwrap() = IMAGE_MODEL_IDLE.into();
+                    log::info!("no images, videos or image clips indexed; image model stays unloaded");
+                }
+            }
+            // OCR is opt-in; only spin it up when the user enabled it
+            {
+                let state = app.state::<AppState>();
+                let on = db::open(&state.db_path)
+                    .ok()
+                    .and_then(|c| db::meta_get(&c, "ocr_enabled").ok().flatten())
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                if on {
+                    spawn_ocr_init(app.handle().clone());
+                }
+            }
+            // refresh quietly at launch: stars (if token configured) + local folders
+            if !WORK_SAFE && option_env!("LOCALSEARCH_PARALLEL_TEST").is_none() {
+                spawn_sync(app.handle().clone());
+            }
+            // STEP17: resume the durable embedding queue immediately via
+            // spawn_model_init above. Avoid a 100K-file full rewalk on every
+            // app restart. New installations still need an initial scan;
+            // existing installations reconcile by the persisted daily timer.
+            let initial_scan = {
+                let state = app.state::<AppState>();
+                db::open(&state.db_path)
+                    .ok()
+                    .and_then(|c| c.query_row(
+                        "SELECT NOT EXISTS(SELECT 1 FROM files)", [],
+                        |r| r.get::<_, bool>(0),
+                    ).ok())
+                    .unwrap_or(true)
+            };
+            if initial_scan && !WORK_SAFE {
+                spawn_local_index(app.handle().clone());
+            } else {
+                log::info!("step17: resuming persistent embedding queue; startup rescan deferred");
+            }
+            if !WORK_SAFE && option_env!("LOCALSEARCH_PARALLEL_TEST").is_none() {
+                spawn_bookmark_sync(app.handle().clone());
+            }
+            // periodic full re-scan: the reconciliation behind the file
+            // watcher (deleted/changed files it missed, bookmarks, videos).
+            // Every `rescan_minutes` (default 30, 0 = off), read once a
+            // minute so a change in settings applies without a restart.
+            // installed apps change while magpie stays open for days: re-list
+            // them and refresh the icons of new or updated ones. Its own timer,
+            // not the file rescan's, which can be switched off. All off the
+            // main thread; with nothing changed a pass is a stat per app.
+            let apps_timer = app.handle().clone();
+            let every = app_rescan_every();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(every).await;
+                    if !WORK_SAFE { spawn_app_scan(apps_timer.clone()); }
+                }
+            });
+
+            let periodic = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let every = rescan_minutes(&periodic);
+                    if every == 0 || WORK_SAFE { continue; }
+                    let due = {
+                        let state = periodic.state::<AppState>();
+                        db::open(&state.db_path).ok().and_then(|c| {
+                            db::meta_get(&c, "last_full_rescan_at").ok().flatten()
+                        }).and_then(|s| s.parse::<u64>().ok())
+                        .map(|last| {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_secs();
+                            now.saturating_sub(last) >= (every as u64).saturating_mul(60)
+                        }).unwrap_or(true)
+                    };
+                    if !due { continue; }
+                    // Set due timestamp before scheduling: restarts and
+                    // failed/cloud scans won't cause a retry storm.
+                    if let Ok(c) = db::open(&periodic.state::<AppState>().db_path) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs();
+                        let _ = db::meta_set(&c, "last_full_rescan_at", &now.to_string());
+                    }
+                    spawn_local_index(periodic.clone());
+                    spawn_bookmark_sync(periodic.clone());
+                    spawn_video_index(periodic.clone());
+                    // no-op unless the engine is loaded (OCR setting on)
+                    spawn_ocr_index(periodic.clone());
+                }
+            });
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                dismiss_palette(window.app_handle());
+                api.prevent_close();
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            transcribe_fluidvoice,
+            local_voice_status,
+            transcribe_local_voice,
+            model_library::optional_models_list,
+            model_library::optional_model_connect,
+            test_diagnostics::test_module_diagnostics,
+            test_diagnostics::test_visual_retry,
+            test_diagnostics::test_asr_transcribe_folder,
+            test_diagnostics::test_voice_install_runtime,
+            search_stars,
+            get_status,
+            set_token,
+            start_sync,
+            open_repo,
+            search_local,
+            search_by_image,
+            preview_thumb,
+            set_max_file_mb,
+            set_hotkey,
+            set_hf_endpoint,
+            list_folders,
+            indexed_sources,
+            add_folder,
+            consolidate_nested_folders,
+            add_folders,
+            common_places,
+            file_origin,
+            web_details,
+            recall_today,
+            recall_skip,
+            today_line,
+            get_pinned_folders,
+            set_pinned_folders,
+            pinned_rows,
+            open_pinned_folder,
+            search_scripts,
+            run_script,
+            scripts_folder,
+            open_scripts_folder,
+            set_scripts_folder,
+            search_workspaces,
+            list_workspaces,
+            workspace_add,
+            workspace_remove_item,
+            workspace_delete,
+            open_workspace,
+            app_choices,
+            get_edit_rules,
+            set_edit_rules,
+            edit_file,
+            remove_folder,
+            index_local,
+            rebuild_folder,
+            rebuild_stars,
+            disconnect_github,
+            set_app_folder,
+            set_semantic,
+            pause_semantic,
+            run_action,
+            top_processes,
+            search_web,
+            search_apps,
+            launch_app,
+            sync_bookmarks_now,
+            search_clips,
+            copy_image_clip,
+            set_clipboard_enabled,
+            set_clip_retention,
+            set_clip_max_entries,
+            delete_clip,
+            clear_clips_now,
+            copy_clip,
+            set_ui_lang,
+            set_app_aliases,
+            set_video_indexing,
+            set_video_decode,
+            get_preview,
+            record_hit_use,
+            paste_clip,
+            play_video,
+            export_settings,
+            import_settings,
+            set_update_badge,
+            set_ocr,
+            set_ocr_pdf,
+            set_term_notify,
+            calc_query,
+            toggle_pin_clip,
+            copy_file_clip,
+            open_log_dir,
+            open_accessibility_settings,
+            take_launch_request,
+            open_file,
+            restart_for_update,
+            resize_palette,
+            enable_palette_user_resize,
+            set_palette_user_sized,
+            note_palette_misfit,
+            dismiss,
+            recent_hits,
+            append_note,
+            set_note_path,
+            open_note_file,
+            set_selection_hotkey,
+            set_skip_worktrees,
+            set_index_threads,
+            set_sleep_index,
+            set_mcp,
+            rotate_mcp_token,
+            set_watch,
+            set_rescan_minutes,
+            get_autostart,
+            set_autostart,
+            app_icon,
+            search_commands,
+            run_system_command,
+            list_processes,
+            end_process,
+            open_path_default,
+            reveal_app,
+            run_app_as_admin,
+            pdf_markdown,
+            save_pdf_markdown,
+            copy_png,
+            refresh_app_icons,
+            browser_icon,
+            web_sources,
+            ocr_clipboard,
+            list_port_processes,
+            installed_editors,
+            open_in_terminal,
+            open_in_editor,
+            trash_path,
+            cached_app_icons,
+            clip_diff,
+            recent_downloads,
+            save_clip_image,
+            start_timer,
+            list_timers,
+            cancel_timer
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    // A launcher is an accessory app, like Spotlight: no Dock icon, no Cmd-Tab
+    // entry, and its windows can overlay another app's full-screen Space.
+    //
+    // This has to happen BEFORE the event loop starts, not in `setup`. tao
+    // applies the stored policy in applicationDidFinishLaunching and only then
+    // emits Ready; Tauri creates the config windows inside that Ready handler,
+    // just before `setup` runs. A window created while the app is Regular is
+    // never admitted to a full-screen Space afterwards, whatever the policy
+    // or collection behaviour is changed to later (verified on macOS 26), so
+    // the switch in `setup` looked right in every log and still left the
+    // palette invisible over full-screen apps.
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    app.run(|handle, event| {
+        // Clicking the Dock icon must restore the window after it was closed.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = event {
+            show_window(handle);
+        }
+    });
+}
+
+
+
+
+
+
+
+
+
+

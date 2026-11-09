@@ -1,0 +1,58 @@
+[package]
+name = "magpie"
+version = "1.0.3"
+description = "Spotlight-style search over things you saved and forgot: GitHub stars, local folders"
+authors = ["kian"]
+edition = "2021"
+
+[lib]
+name = "magpie_lib"
+# rlib only: the desktop binary links it. tauri's template also builds a
+# cdylib and a staticlib for mobile, which magpie does not ship, and since
+# tauri-cli 2.12 the Windows installers pick up the magpie_lib.dll next to
+# the exe (24 MB nothing loads)
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-dialog = "2"
+magpie-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+base64 = "0.22"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-log = "2"
+tauri-plugin-single-instance = "2"
+enigo = "0.2"
+# MCP server for AI assistants (src/mcp.rs): rmcp speaks the protocol over
+# Streamable HTTP, axum hosts it on the loopback interface, schemars derives
+# the tool schemas, getrandom mints the bearer token
+rmcp = { version = "3.2.0", features = ["server", "transport-streamable-http-server"] }
+axum = "0.8"
+schemars = "1"
+getrandom = "0.3"
+tokio-util = "0.7"
+notify = "8.2.0"
+tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2.4.0"
+
+[dev-dependencies]
+# the MCP integration test talks to the server with rmcp's own client
+rmcp = { version = "3.2.0", features = ["client", "reqwest", "transport-streamable-http-client-reqwest"] }
+reqwest = { version = "0.13", features = ["json"] }
+
+[target."cfg(windows)".dependencies]
+winreg = "0.55"
+
+[target."cfg(target_os = \"macos\")".dependencies]
+# NSWindow collection behaviour: tao never sets FullScreenAuxiliary, so the
+# palette could not appear over another app's full-screen Space
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSWindow"] }
